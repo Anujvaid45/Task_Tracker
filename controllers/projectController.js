@@ -515,6 +515,19 @@ exports.updateProject = async (req, res) => {
     const todayUTC = new Date();
     todayUTC.setHours(0, 0, 0, 0);
 
+    const computeOnTrackStatus = (plannedEndDate) => {
+  if (!plannedEndDate) return "On Track";
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const planned = new Date(plannedEndDate);
+  planned.setHours(0, 0, 0, 0);
+
+  return today > planned ? "Delayed" : "On Track";
+};
+
+
     // --- Allowed fields ---
     const allowedFields = {
       module_id: req.body.moduleId ?? currentProject.MODULE_ID,
@@ -588,7 +601,9 @@ exports.updateProject = async (req, res) => {
         ? await calculateManDays(allowedFields.start_date, allowedFields.planned_end_date)
         : currentProject.MAN_DAYS;
 
-    allowedFields.on_track_status = allowedFields.on_track_status ?? currentProject.ON_TRACK_STATUS ?? "On Track";
+allowedFields.on_track_status = computeOnTrackStatus(
+  allowedFields.planned_end_date
+);
 
     // --- Determine changes ---
     const changes = {};
