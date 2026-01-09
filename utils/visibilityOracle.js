@@ -15,10 +15,16 @@ function buildVisibilityOracle(user, query = {}) {
   // ----------------------------------------------------------
   // Optional application-level filter
   // ----------------------------------------------------------
-  if (applicationName && String(applicationName).trim() !== "") {
-    whereClauses.push("UPPER(e.application_name) = UPPER(:appName)");
-    binds.appName = String(applicationName).trim();
-  }
+if (applicationName && String(applicationName).trim() !== "") {
+  whereClauses.push(`
+    REGEXP_LIKE(
+      LOWER(e.application_name),
+      '(^|,)\\s*' || LOWER(:appName) || '\\s*(,|$)'
+    )
+  `);
+  binds.appName = String(applicationName).trim();
+}
+
 
   // ----------------------------------------------------------
   // Role-based hierarchy visibility
