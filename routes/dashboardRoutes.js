@@ -83,11 +83,6 @@ router.get(
         ${sqlCondition}
         GROUP BY t.e_id, t.status
       `;
-  console.log("========= SQL DEBUG =========");
-console.log("SQL:", sql);
-console.log("BINDS:", binds);
-console.log("PLACEHOLDERS:", sql.match(/:\w+/g));
-console.log("========= END DEBUG =========");
 
       const result = await connection.execute(sql, binds, {
         outFormat: oracledb.OUT_FORMAT_OBJECT,
@@ -204,15 +199,27 @@ router.get("/workload", authMiddleware(["admin", "manager","alt", "lt", "head_lt
     // --------------------------------------------------------------------------------
     const logQuery = `
       SELECT 
-        tc.task_id,
-        cw.employee_id,
-        SUM(NVL(cw.hours_logged, 0)) AS logged_hours
-      FROM component_worklogs cw
-      JOIN task_components tc 
-        ON cw.task_component_id = tc.task_component_id
-      WHERE cw.log_date BETWEEN :startDate AND :endDate
-        AND tc.task_id IN (${taskIds.map((_, i) => `:tid${i}`).join(",")})
-      GROUP BY tc.task_id, cw.employee_id
+  tc.task_id,
+  cw.employee_id,
+
+  -- 🔵 Monthly logged hours
+  SUM(
+    CASE 
+      WHEN cw.log_date BETWEEN :startDate AND :endDate
+      THEN NVL(cw.hours_logged, 0)
+      ELSE 0
+    END
+  ) AS MONTH_LOGGED_HOURS,
+
+  -- 🟢 Lifetime logged hours
+  SUM(NVL(cw.hours_logged, 0)) AS TOTAL_LOGGED_HOURS
+
+FROM component_worklogs cw
+JOIN task_components tc 
+  ON cw.task_component_id = tc.task_component_id
+WHERE tc.task_id IN (${taskIds.map((_, i) => `:tid${i}`).join(",")})
+GROUP BY tc.task_id, cw.employee_id
+
     `;
 
     const logBinds = {
@@ -227,29 +234,39 @@ router.get("/workload", authMiddleware(["admin", "manager","alt", "lt", "head_lt
 
     // Map key = `${task_id}_${employee_id}` → logged_hours
     const logMap = Object.fromEntries(
-      logResult.rows.map(r => [`${r.TASK_ID}_${r.EMPLOYEE_ID}`, r.LOGGED_HOURS || 0])
-    );
-    console.log("map",logMap)
+  logResult.rows.map(r => [
+    `${r.TASK_ID}_${r.EMPLOYEE_ID}`,
+    {
+      month: r.MONTH_LOGGED_HOURS || 0,
+      total: r.TOTAL_LOGGED_HOURS || 0,
+    }
+  ])
+);
+
     // --------------------------------------------------------------------------------
     // STEP 3️⃣ - Combine base + logged data
     // --------------------------------------------------------------------------------
-    const combined = baseResult.rows.map(row => {
-      const logged = logMap[`${row.TASK_ID}_${row.E_ID}`] || 0;
-      const total = row.TOTAL_HOURS || 0;
-      const completed = Math.min(logged, total);
-      const pending = Math.max(total - logged, 0);
+   const combined = baseResult.rows.map(row => {
+  const logs = logMap[`${row.TASK_ID}_${row.E_ID}`] || { month: 0, total: 0 };
 
-      return {
-        e_id: row.E_ID,
-        module_id: row.MODULE_ID,
-        project_id: row.PROJECT_ID,
-        total_hours: total,
-        completed_hours: completed,
-        pending_hours: pending,
-        overdue_hours: row.OVERDUE_HOURS || 0,
-      };
-    });
-    console.log("combined",combined)
+  const total = row.TOTAL_HOURS || 0;
+  const completed = Math.min(logs.total, total);
+  const pending = Math.max(total - completed, 0);
+
+  return {
+    e_id: row.E_ID,
+    module_id: row.MODULE_ID,
+    project_id: row.PROJECT_ID,
+
+    total_hours: total,
+    completed_hours: completed,          // 🟢 cumulative
+    pending_hours: pending,
+    overdue_hours: row.OVERDUE_HOURS || 0,
+
+    month_logged_hours: logs.month        // 🔵 optional (for UI)
+  };
+});
+
 
     // --------------------------------------------------------------------------------
 // STEP 4️⃣ - Aggregate per employee + module + project (sum all relevant hours)
@@ -352,26 +369,18 @@ const aggregated = Object.values(
 // ------------------ MODULE SUMMARY ROUTE ------------------
 router.get(
   "/module-summary",
-  authMiddleware(["admin", "manager","alt", "lt", "head_lt"]),
+  authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),
   async (req, res) => {
     return safeRoute(req, res, async (connection) => {
 
-      const { month, year } = req.query;
-      if (!month || !year)
-        return res.status(400).json({ error: "month and year are required" });
-
-      const startDate = new Date(year, month - 1, 1);
-      const endDate = new Date(year, month, 0, 23, 59, 59);
       const today = new Date();
 
       // 🔹 Centralized role + application filter
       const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
-      binds.startDate = startDate;
-      binds.endDate = endDate;
       binds.today = today;
 
       // ------------------------------------------------------------
-      // STEP 1️⃣ - Core Query (tasks due OR worked in month)
+      // STEP 1️⃣ - Core Query (DATE-INDEPENDENT)
       // ------------------------------------------------------------
       const sql = `
         SELECT
@@ -421,17 +430,7 @@ router.get(
         LEFT JOIN employees e ON t.e_id = e.id
 
         WHERE t.e_id IS NOT NULL
-          AND (
-            t.due_date BETWEEN :startDate AND :endDate
-            OR EXISTS (
-              SELECT 1
-              FROM component_worklogs cw
-              JOIN task_components tc ON cw.task_component_id = tc.task_component_id
-              WHERE tc.task_id = t.task_id
-                AND cw.log_date BETWEEN :startDate AND :endDate
-            )
-          )
-          ${sqlCondition}
+        ${sqlCondition}
 
         GROUP BY m.id, m.name
         ORDER BY m.name
@@ -442,39 +441,32 @@ router.get(
       });
 
       // ------------------------------------------------------------
-      // STEP 2️⃣ - Response (same format)
+      // STEP 2️⃣ - Response
       // ------------------------------------------------------------
       res.json({
         modules: modulesRes.rows || [],
         selectedApplication: req.query.applicationName || "all",
       });
     });
-});
+  }
+);
+
 
 // ---------------------- Project Summary ----------------------
 router.get(
   "/project-summary",
-  authMiddleware(["admin", "manager","alt", "lt", "head_lt"]),
+  authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),
   async (req, res) => {
     return safeRoute(req, res, async (connection) => {
-      const { month, year, tlId } = req.query;
-      if (!month || !year)
-        return res.status(400).json({ error: "month and year are required" });
-
+      const { tlId } = req.query;
 
       // 🔹 Centralized visibility & app filter
       const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
 
-      // 🔹 Date range (due or worked)
-      const startDate = new Date(year, month - 1, 1);
-      const endDate = new Date(year, month, 0, 23, 59, 59);
       const today = new Date();
-
-      binds.startDate = startDate;
-      binds.endDate = endDate;
       binds.today = today;
 
-      // ✅ If TL filter applied, use techFprTL instead of employee visibility
+      // ✅ If TL filter applied, use tech_fpr_tl instead of employee visibility
       let projectFilterSQL = sqlCondition;
       if (tlId) {
         projectFilterSQL += ` AND p.tech_fpr_tl = :tlId`;
@@ -482,12 +474,15 @@ router.get(
       }
 
       // --------------------------------------------------
-      // STEP 1️⃣ - Project summary (tasks due OR worked)
+      // STEP 1️⃣ - Project summary (DATE-INDEPENDENT)
       // --------------------------------------------------
       const summarySQL = `
         SELECT
           p.id AS "projectId",
           p.name AS "projectName",
+          p.PLANNED_END_DATE AS "plannedEndDate",
+          p.ON_TRACK_STATUS AS "onTrackStatus",
+          p.GO_LIVE_END_DATE AS "goLiveEndDate",
           m.name AS "moduleName",
           p.project_stage AS "projectStage",
           COUNT(DISTINCT t.task_id) AS "taskCount",
@@ -530,18 +525,8 @@ router.get(
         LEFT JOIN tasks t ON t.project_id = p.id
         LEFT JOIN employees e ON t.e_id = e.id
         WHERE t.e_id IS NOT NULL
-          AND (
-            t.due_date BETWEEN :startDate AND :endDate
-            OR EXISTS (
-              SELECT 1 
-              FROM component_worklogs cw
-              JOIN task_components tc ON cw.task_component_id = tc.task_component_id
-              WHERE tc.task_id = t.task_id
-                AND cw.log_date BETWEEN :startDate AND :endDate
-            )
-          )
-          ${projectFilterSQL}
-        GROUP BY p.id, p.name, m.name, p.project_stage
+        ${projectFilterSQL}
+        GROUP BY p.id, p.name, m.name, p.project_stage, p.planned_end_date, p.on_track_status,p.go_live_end_date
         ORDER BY p.name
       `;
 
@@ -550,6 +535,7 @@ router.get(
       });
 
       const projects = summaryResult.rows || [];
+      console.log(projects)
       if (projects.length === 0) {
         return res.json({
           projects: [],
@@ -569,6 +555,7 @@ router.get(
         FROM projects p
         WHERE p.id IN (${projectIds.map((_, i) => `:id${i}`).join(",")})
       `;
+
       const clobBinds = projectIds.reduce(
         (acc, id, i) => ({ ...acc, [`id${i}`]: id }),
         {}
@@ -605,6 +592,7 @@ router.get(
           );
           existingLog = [];
         }
+
         changeLogs.push({
           projectId: row.projectId,
           updatedAt: row.updatedAt,
@@ -635,7 +623,7 @@ router.get(
       }));
 
       // --------------------------------------------------
-      // STEP 5️⃣ - Send final response
+      // STEP 5️⃣ - Final response
       // --------------------------------------------------
       res.json({
         projects: projectsWithStages,
@@ -644,6 +632,7 @@ router.get(
     });
   }
 );
+
 
 
 router.get(
@@ -893,70 +882,78 @@ router.get("/overdue", authMiddleware(["admin", "manager","alt", "lt", "head_lt"
 });
 
 // ---------------------- Delayed Tasks ----------------------
-router.get("/delayed", authMiddleware(["admin", "manager","alt", "lt", "head_lt"]), async (req, res) => {
-  return safeRoute(req, res, async (connection) => {
-    const { month, year } = req.query;
-    connection = await oracledb.getConnection();
+router.get(
+  "/delayed",
+  authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (connection) => {
+      const { month, year } = req.query;
 
-    // 🔹 Centralized role + application filter
-    const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
+      // 🔹 Centralized role + application filter
+      const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
 
-    // 🔹 Month/year filter (optional)
-    let monthFilter = "";
-    if (month && year) {
-      monthFilter = "EXTRACT(MONTH FROM t.due_date) = :month AND EXTRACT(YEAR FROM t.due_date) = :year";
-      binds.month = month;
-      binds.year = year;
-    }
+      // 🔹 Optional month/year filter (based on due date)
+      let monthFilter = "";
+      if (month && year) {
+        monthFilter = `
+          EXTRACT(MONTH FROM t.due_date) = :month
+          AND EXTRACT(YEAR FROM t.due_date) = :year
+        `;
+        binds.month = month;
+        binds.year = year;
+      }
 
-    // ---------------------------------------------
-    // 🔹 SQL Query for delayed tasks
-    // ---------------------------------------------
-    const sql = `
-      SELECT 
-        t.task_id AS "taskId",
-        t.title AS "title",
-        t.status AS "status",
-        t.due_date AS "dueDate",
-        t.completed_at AS "completedAt",
-        t.created_at AS "createdAt",
-        t.updated_at AS "updatedAt",
-        e.id AS "employeeId",
-        e.name AS "employeeName"
-      FROM tasks t
-      JOIN employees e ON t.e_id = e.id
-      WHERE 
-        t.completed_at > t.due_date
-        AND t.status IN ('Live','Preprod_Signoff','Completed')
-        ${sqlCondition}
-        ${monthFilter ? `AND ${monthFilter}` : ""}
-      ORDER BY t.completed_at ASC
-    `;
+      // ---------------------------------------------
+      // 🔹 SQL Query (FIXED DATE COMPARISON)
+      // ---------------------------------------------
+      const sql = `
+        SELECT 
+          t.task_id AS "taskId",
+          t.title AS "title",
+          t.status AS "status",
+          t.due_date AS "dueDate",
+          t.completed_at AS "completedAt",
+          t.created_at AS "createdAt",
+          t.updated_at AS "updatedAt",
+          e.id AS "employeeId",
+          e.name AS "employeeName"
+        FROM tasks t
+        JOIN employees e ON t.e_id = e.id
+        WHERE 
+          TRUNC(t.completed_at) > TRUNC(t.due_date)
+          AND t.status IN ('Live','Preprod_Signoff','Completed')
+          ${sqlCondition}
+          ${monthFilter ? `AND ${monthFilter}` : ""}
+        ORDER BY t.completed_at ASC
+      `;
 
-    const result = await connection.execute(sql, binds, { outFormat: oracledb.OUT_FORMAT_OBJECT });
+      const result = await connection.execute(sql, binds, {
+        outFormat: oracledb.OUT_FORMAT_OBJECT,
+      });
 
-    // ---------------------------------------------
-    // 🔹 Format data for frontend (same as before)
-    // ---------------------------------------------
-    const delayed = result.rows.map(row => ({
-      taskId: row.taskId,
-      title: row.title,
-      status: row.status,
-      employeeId: { id: row.employeeId, name: row.employeeName },
-      dueDateRaw: row.dueDate,
-      createdAtRaw: row.createdAt,
-      updatedAtRaw: row.updatedAt,
-      completedAtRaw: row.completedAt,
-      dueDate: formatDateForDisplay(row.dueDate),
-      createdAt: formatDateForDisplay(row.createdAt),
-      updatedAt: formatDateForDisplay(row.updatedAt),
-      completedAt: formatDateForDisplay(row.completedAt),
-    }));
+      // ---------------------------------------------
+      // 🔹 Format response
+      // ---------------------------------------------
+      const delayed = result.rows.map(row => ({
+        taskId: row.taskId,
+        title: row.title,
+        status: row.status,
+        employeeId: { id: row.employeeId, name: row.employeeName },
+        dueDateRaw: row.dueDate,
+        createdAtRaw: row.createdAt,
+        updatedAtRaw: row.updatedAt,
+        completedAtRaw: row.completedAt,
+        dueDate: formatDateForDisplay(row.dueDate),
+        createdAt: formatDateForDisplay(row.createdAt),
+        updatedAt: formatDateForDisplay(row.updatedAt),
+        completedAt: formatDateForDisplay(row.completedAt),
+      }));
 
-    res.json(delayed);
+      res.json(delayed);
+    });
+  }
+);
 
-  });
-});
 
 // ---------------------- Tasks Progress Weekly ----------------------
 router.get(

@@ -288,205 +288,209 @@ async function calculateWorkload(components = [], connection) {
 //ora--0001 fix code
 router.post(
   "/",
-  authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),async (req, res) => {
+  authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),
+  async (req, res) => {
     return safeRoute(req, res, async (conn) => {
 
+      conn.autoCommit = false;
 
-    // Disable autocommit for full transaction
-    conn.autoCommit = false;
+      const {
+        moduleId,
+        projectId,
+        employeeId,
+        title,
+        description,
+        dueDate,
+        components = [],
+        priority,
+        status = "Pending",
+        notes,
+        attachments,
+      } = req.body;
 
-    const {
-      moduleId,
-      projectId,
-      employeeId,
-      title,
-      description,
-      dueDate,
-      components = [],
-      priority,
-      status = "Pending",
-      notes,
-      attachments,
-    } = req.body;
+      // ------------------------------------------------------------
+      // 1️⃣ VISIBILITY CHECK
+      // ------------------------------------------------------------
+      const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.body);
+      binds.employeeId = employeeId;
 
-    // ------------------------------------------------------------
-    // 1️⃣ VISIBILITY CHECK (Uses buildVisibilityOracle)
-    // ------------------------------------------------------------
-    const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.body);
-    binds.employeeId = employeeId;
+      const visibilityQuery = `
+        SELECT e.id 
+        FROM employees e
+        WHERE e.id = :employeeId
+        ${sqlCondition}
+      `;
 
-    const visibilityQuery = `
-      SELECT e.id 
-      FROM employees e
-      WHERE e.id = :employeeId
-      ${sqlCondition}
-    `;
-
-    const vis = await conn.execute(visibilityQuery, binds, {
-      outFormat: oracledb.OUT_FORMAT_OBJECT,
-    });
-
-    if (!vis.rows.length) {
-      await conn.rollback();
-      return res.status(403).json({
-        error: "You are not authorized to assign this employee.",
+      const vis = await conn.execute(visibilityQuery, binds, {
+        outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
-    }
 
-    // ------------------------------------------------------------
-    // 2️⃣ MANAGER SELECTION + WORKLOAD LOGIC
-    // ------------------------------------------------------------
-    const managerId =
-      req.user.role === "admin" ? req.user.managerId : req.user.id;
+      if (!vis.rows.length) {
+        await conn.rollback();
+        return res.status(403).json({
+          error: "You are not authorized to assign this employee.",
+        });
+      }
 
-    let workloadHours = 0;
-    let processedComponents = [];
+      // ------------------------------------------------------------
+      // 2️⃣ MANAGER + WORKLOAD
+      // ------------------------------------------------------------
+      const managerId =
+        req.user.role === "admin" ? req.user.managerId : req.user.id;
 
-    if (components.length > 0) {
-      const r = await calculateWorkload(components, conn);
-      workloadHours = r.workloadHours;
-      processedComponents = r.processedComponents;
-    }
+      let workloadHours = 0;
+      let processedComponents = [];
 
-    const completedStatuses = ["Live", "Preprod_Signoff", "Completed"];
-    const completedAt = completedStatuses.includes(status)
-      ? new Date()
-      : null;
+      if (components.length > 0) {
+        const r = await calculateWorkload(components, conn);
+        workloadHours = r.workloadHours;
+        processedComponents = r.processedComponents;
+      }
 
-    // ------------------------------------------------------------
-    // 3️⃣ INSERT TASK (Oracle Identity auto-generates task_id)
-    // ------------------------------------------------------------
-    const insertTaskSql = `
-      INSERT INTO TASKS
-        (MODULE_ID, PROJECT_ID, E_ID, MANAGER_ID, TITLE, DESCRIPTION,
-         DUE_DATE, PRIORITY, STATUS, WORKLOAD_HOURS, COMPLETED_AT,
-         CREATED_AT, UPDATED_AT)
-      VALUES
-        (:moduleId, :projectId, :employeeId, :managerId,
-         :title, :description, TO_DATE(:dueDate,'YYYY-MM-DD'),
-         :priority, :status, :workloadHours, :completedAt,
-         SYSTIMESTAMP, SYSTIMESTAMP)
-      RETURNING TASK_ID INTO :taskId
-    `;
+      const completedStatuses = ["Live", "Preprod_Signoff", "Completed"];
+      const completedAt = completedStatuses.includes(status)
+        ? new Date()
+        : null;
 
-    const taskInsertResult = await conn.execute(insertTaskSql, {
-      moduleId: Number(moduleId),
-      projectId: Number(projectId),
-      employeeId: Number(employeeId),
-      managerId: Number(managerId),
-      title,
-      description,
-      dueDate,
-      priority: priority || "Medium",
-      status,
-      workloadHours,
-      completedAt,
-      taskId: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
-    });
-
-    const taskId = taskInsertResult.outBinds.taskId[0];
-
-    // ------------------------------------------------------------
-    // 4️⃣ INSERT COMPONENTS
-    // ------------------------------------------------------------
-    for (const c of processedComponents) {
-      await conn.execute(
-        `
-        INSERT INTO TASK_COMPONENTS
-          (TASK_COMPONENT_ID, TASK_ID, TYPE, COMPLEXITY, COUNT,
-           HOURS_PER_ITEM, TOTAL_COMP_HOURS, FILE_REQUIRED, FILE_TYPE)
+      // ------------------------------------------------------------
+      // 3️⃣ INSERT TASK USING SEQ_TASK
+      // ------------------------------------------------------------
+      const insertTaskSql = `
+        INSERT INTO TASKS
+          (TASK_ID, MODULE_ID, PROJECT_ID, E_ID, MANAGER_ID, TITLE, DESCRIPTION,
+           DUE_DATE, PRIORITY, STATUS, WORKLOAD_HOURS, COMPLETED_AT,
+           CREATED_AT, UPDATED_AT)
         VALUES
-          (TASK_COMPONENT_SEQ.NEXTVAL, :taskId, :type, :complexity,
-           :count, :hoursPerItem, :totalCompHours, :fileRequired, :fileType)
-      `,
+          (SEQ_TASK.NEXTVAL, :moduleId, :projectId, :employeeId, :managerId,
+           :title, :description, TO_DATE(:dueDate,'YYYY-MM-DD'),
+           :priority, :status, :workloadHours, :completedAt,
+           SYSTIMESTAMP, SYSTIMESTAMP)
+        RETURNING TASK_ID INTO :taskId
+      `;
+
+      const taskInsertResult = await conn.execute(
+        insertTaskSql,
         {
-          taskId,
-          type: c.type,
-          complexity: c.complexity,
-          count: c.count,
-          hoursPerItem: c.hoursPerItem,
-          totalCompHours: c.totalCompHours,
-          fileRequired: c.fileRequired || null,
-          fileType: c.fileType || null,
+          moduleId: Number(moduleId),
+          projectId: Number(projectId),
+          employeeId: Number(employeeId),
+          managerId: Number(managerId),
+          title,
+          description,
+          dueDate,
+          priority: priority || "Medium",
+          status,
+          workloadHours,
+          completedAt,
+          taskId: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
         }
       );
-    }
 
-    // ------------------------------------------------------------
-    // 5️⃣ INSERT NOTES
-    // ------------------------------------------------------------
-    if (notes && notes.length > 0) {
-      for (const n of notes) {
+      const taskId = taskInsertResult.outBinds.taskId[0];
+
+      // ------------------------------------------------------------
+      // 4️⃣ INSERT COMPONENTS USING SEQ_TASK_COMPONENT
+      // ------------------------------------------------------------
+      for (const c of processedComponents) {
         await conn.execute(
           `
-          INSERT INTO TASK_NOTES
-            (TASK_NOTE_ID, TASK_ID, CONTENT, CREATED_BY, CREATED_AT)
+          INSERT INTO TASK_COMPONENTS
+            (TASK_COMPONENT_ID, TASK_ID, TYPE, COMPLEXITY, COUNT,
+             HOURS_PER_ITEM, TOTAL_COMP_HOURS, FILE_REQUIRED, FILE_TYPE)
           VALUES
-            (TASK_NOTE_SEQ.NEXTVAL, :taskId, :content, :createdBy, SYSTIMESTAMP)
+            (SEQ_TASK_COMPONENT.NEXTVAL, :taskId, :type, :complexity,
+             :count, :hoursPerItem, :totalCompHours, :fileRequired, :fileType)
         `,
           {
             taskId,
-            content: n.content,
-            createdBy: req.user.id,
+            type: c.type,
+            complexity: c.complexity,
+            count: c.count,
+            hoursPerItem: c.hoursPerItem,
+            totalCompHours: c.totalCompHours,
+            fileRequired: c.fileRequired || null,
+            fileType: c.fileType || null,
           }
         );
       }
-    }
 
-    // ------------------------------------------------------------
-    // 6️⃣ INSERT ATTACHMENTS
-    // ------------------------------------------------------------
-    if (attachments && attachments.length > 0) {
-      for (const file of attachments) {
-        await conn.execute(
-          `
-          INSERT INTO TASK_ATTACHMENTS
-            (TASK_ATTACHMENT_ID, TASK_ID, FILENAME, ORIGINAL_NAME, PATH, UPLOADED_AT)
-          VALUES
-            (TASK_ATTACHMENT_SEQ.NEXTVAL, :taskId, :filename, :originalName, :path, SYSTIMESTAMP)
-        `,
-          {
-            taskId,
-            filename: file.filename,
-            originalName: file.originalName,
-            path: file.path,
-          }
-        );
+      // ------------------------------------------------------------
+      // 5️⃣ INSERT NOTES USING SEQ_TASK_NOTE
+      // ------------------------------------------------------------
+      if (notes && notes.length > 0) {
+        for (const n of notes) {
+          await conn.execute(
+            `
+            INSERT INTO TASK_NOTES
+              (TASK_NOTE_ID, TASK_ID, CONTENT, CREATED_BY, CREATED_AT)
+            VALUES
+              (SEQ_TASK_NOTE.NEXTVAL, :taskId, :content, :createdBy, SYSTIMESTAMP)
+          `,
+            {
+              taskId,
+              content: n.content,
+              createdBy: req.user.id,
+            }
+          );
+        }
       }
-    }
 
-    // ------------------------------------------------------------
-    // 7️⃣ SINGLE COMMIT
-    // ------------------------------------------------------------
-    await conn.commit();
+      // ------------------------------------------------------------
+      // 6️⃣ INSERT ATTACHMENTS USING SEQ_TASK_ATTACHMENT
+      // ------------------------------------------------------------
+      if (attachments && attachments.length > 0) {
+        for (const file of attachments) {
+          await conn.execute(
+            `
+            INSERT INTO TASK_ATTACHMENTS
+              (TASK_ATTACHMENT_ID, TASK_ID, FILENAME, ORIGINAL_NAME, PATH, UPLOADED_AT)
+            VALUES
+              (SEQ_TASK_ATTACHMENT.NEXTVAL, :taskId, :filename, :originalName, :path, SYSTIMESTAMP)
+          `,
+            {
+              taskId,
+              filename: file.filename,
+              originalName: file.originalName,
+              path: file.path,
+            }
+          );
+        }
+      }
 
-    // ------------------------------------------------------------
-    // 8️⃣ RETURN CREATED TASK
-    // ------------------------------------------------------------
-    const fetchTaskSql = `
-      SELECT 
-        t.*,
-        e.NAME AS EMPLOYEE_NAME,
-        e.DESIGNATION AS EMPLOYEE_DESIGNATION,
-        e.EMAIL AS EMPLOYEE_EMAIL,
-        m.NAME AS MODULE_NAME,
-        p.NAME AS PROJECT_NAME
-      FROM TASKS t
-      LEFT JOIN EMPLOYEES e ON t.E_ID = e.ID
-      LEFT JOIN MODULES m ON t.MODULE_ID = m.ID
-      LEFT JOIN PROJECTS p ON t.PROJECT_ID = p.ID
-      WHERE t.TASK_ID = :taskId
-    `;
+      // ------------------------------------------------------------
+      // 7️⃣ COMMIT
+      // ------------------------------------------------------------
+      await conn.commit();
 
-    const taskResult = await conn.execute(
-      fetchTaskSql,
-      { taskId },
-      { outFormat: oracledb.OUT_FORMAT_OBJECT }
-    );
+      // ------------------------------------------------------------
+      // 8️⃣ RETURN TASK
+      // ------------------------------------------------------------
+      const fetchTaskSql = `
+        SELECT 
+          t.*,
+          e.NAME AS EMPLOYEE_NAME,
+          e.DESIGNATION AS EMPLOYEE_DESIGNATION,
+          e.EMAIL AS EMPLOYEE_EMAIL,
+          m.NAME AS MODULE_NAME,
+          p.NAME AS PROJECT_NAME
+        FROM TASKS t
+        LEFT JOIN EMPLOYEES e ON t.E_ID = e.ID
+        LEFT JOIN MODULES m ON t.MODULE_ID = m.ID
+        LEFT JOIN PROJECTS p ON t.PROJECT_ID = p.ID
+        WHERE t.TASK_ID = :taskId
+      `;
 
-    return res.json(formatTaskDates(taskResult.rows[0]));
-  });
-});
+      const taskResult = await conn.execute(
+        fetchTaskSql,
+        { taskId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      return res.json(formatTaskDates(taskResult.rows[0]));
+    });
+  }
+);
+
 
 
 
@@ -545,7 +549,7 @@ router.post(
         allowed =
           Number(component.REPORTING_MANAGER) === Number(user.id) ||
           Number(component.EMPLOYEE_ID) === Number(user.id);
-      } else if (["lt", "head_lt"].includes(user.role.toLowerCase())) {
+      } else if (["alt","lt", "head_lt"].includes(user.role.toLowerCase())) {
         const { sqlCondition, binds } = buildVisibilityOracle(user, {});
         const checkQuery = `
           SELECT 1 
@@ -686,61 +690,168 @@ function formatLogsDates(logs) {
 
 router.put(
   "/components/log/:logId",
-  authMiddleware(["employee", "admin", "manager","lt","alt","head_lt"]),async (req, res) => {
-     return safeRoute(req, res, async (connection) => {
-
-      const logId = req.params.logId;
+  authMiddleware(["employee", "admin", "manager", "lt", "alt", "head_lt"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (connection) => {
+      const logId = Number(req.params.logId);
       const { hoursLogged, logDate, notes } = req.body;
       const userId = req.user.id;
 
-      if (!hoursLogged || !logDate) {
+      if (hoursLogged === undefined || !logDate) {
         return res.status(400).json({ error: "Hours and log date required" });
       }
 
-      // Validate ownership
-      const result = await connection.execute(
-        `SELECT c.TOTAL_COMP_HOURS, t.E_ID, wl.HOURS_LOGGED AS OLD_HOURS
-         FROM COMPONENT_WORKLOGS wl
-         JOIN TASK_COMPONENTS c ON wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
-         JOIN TASKS t ON c.TASK_ID = t.TASK_ID
-         WHERE wl.WORKLOG_ID = :logId`,
+      // ------------------------------------------------------------------
+      // 1️⃣ Fetch log + component + task
+      // ------------------------------------------------------------------
+      const logRes = await connection.execute(
+        `
+        SELECT
+          wl.WORKLOG_ID,
+          wl.TASK_COMPONENT_ID,
+          wl.HOURS_LOGGED AS OLD_HOURS,
+          c.TOTAL_COMP_HOURS,
+          c.STATUS AS COMPONENT_STATUS,
+          t.TASK_ID,
+          t.STATUS AS TASK_STATUS,
+          t.E_ID
+        FROM COMPONENT_WORKLOGS wl
+        JOIN TASK_COMPONENTS c ON wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
+        JOIN TASKS t ON c.TASK_ID = t.TASK_ID
+        WHERE wl.WORKLOG_ID = :logId
+        `,
         { logId },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
-      if (result.rows.length === 0) return res.status(404).json({ error: "Log not found" });
+      if (!logRes.rows.length)
+        return res.status(404).json({ error: "Log not found" });
 
-      const log = result.rows[0];
-      if (Number(log.E_ID) !== Number(userId)) return res.status(403).json({ error: "Unauthorized" });
+      const log = logRes.rows[0];
 
-      // Check for over-logging
-      const loggedHoursResult = await connection.execute(
-        `SELECT SUM(HOURS_LOGGED) AS TOTAL_LOGGED
-         FROM COMPONENT_WORKLOGS
-         WHERE TASK_COMPONENT_ID = :componentId AND WORKLOG_ID != :logId`,
-        { componentId: log.COMPONENT_ID, logId }
-      );
-      const totalLogged = loggedHoursResult.rows[0][0] || 0;
-      const remainingHours = log.TOTAL_COMP_HOURS - totalLogged;
-      if (hoursLogged > remainingHours) {
-        return res.status(400).json({ error: `Cannot log more than remaining ${remainingHours} hours.` });
+      if (Number(log.E_ID) !== Number(userId))
+        return res.status(403).json({ error: "Unauthorized" });
+
+      // ------------------------------------------------------------------
+      // 2️⃣ Lock completed components
+      // ------------------------------------------------------------------
+      if (log.COMPONENT_STATUS === "Completed") {
+        return res.status(400).json({
+          error:
+            "This component is already completed. Logs cannot be edited.",
+        });
       }
 
-      // Update
+      // ------------------------------------------------------------------
+      // 3️⃣ Calculate remaining hours safely
+      // ------------------------------------------------------------------
+      const sumRes = await connection.execute(
+        `
+        SELECT NVL(SUM(HOURS_LOGGED),0) AS TOTAL
+        FROM COMPONENT_WORKLOGS
+        WHERE TASK_COMPONENT_ID = :cid
+          AND WORKLOG_ID != :logId
+        `,
+        {
+          cid: log.TASK_COMPONENT_ID,
+          logId,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      const alreadyLogged = sumRes.rows[0].TOTAL || 0;
+      const remaining = log.TOTAL_COMP_HOURS - alreadyLogged;
+
+      // ❌ Cannot exceed remaining
+      if (hoursLogged > remaining) {
+        return res.status(400).json({
+          error: `Only ${remaining} hours remaining. Mark component as Completed to finish.`,
+        });
+      }
+
+      // ❌ Cannot exactly finish via edit
+      if (hoursLogged === remaining) {
+        return res.status(400).json({
+          error:
+            "You cannot complete a component via log edit. Use the status dropdown to mark it Completed.",
+        });
+      }
+
+      // ------------------------------------------------------------------
+      // 4️⃣ Update log
+      // ------------------------------------------------------------------
       await connection.execute(
-        `UPDATE COMPONENT_WORKLOGS
-         SET HOURS_LOGGED = :hoursLogged,
-             LOG_DATE = TO_DATE(:logDate,'YYYY-MM-DD'),
-             NOTES = :notes
-         WHERE WORKLOG_ID = :logId`,
-        { hoursLogged, logDate, notes, logId }
+        `
+        UPDATE COMPONENT_WORKLOGS
+        SET
+          HOURS_LOGGED = :hours,
+          LOG_DATE = TO_DATE(:logDate,'YYYY-MM-DD'),
+          NOTES = :notes
+        WHERE WORKLOG_ID = :logId
+        `,
+        {
+          hours: hoursLogged,
+          logDate,
+          notes,
+          logId,
+        }
+      );
+
+      // ------------------------------------------------------------------
+      // 5️⃣ Recalculate component & task status
+      // ------------------------------------------------------------------
+
+      // Component status
+      let newCompStatus = "Pending";
+      if (alreadyLogged + hoursLogged > 0) newCompStatus = "Under_Development";
+
+      await connection.execute(
+        `
+        UPDATE TASK_COMPONENTS
+        SET STATUS = :status
+        WHERE TASK_COMPONENT_ID = :cid
+        `,
+        {
+          status: newCompStatus,
+          cid: log.TASK_COMPONENT_ID,
+        }
+      );
+
+      // Task status recalculation
+      const taskCompRes = await connection.execute(
+        `
+        SELECT STATUS FROM TASK_COMPONENTS
+        WHERE TASK_ID = :taskId
+        `,
+        { taskId: log.TASK_ID },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      const statuses = taskCompRes.rows.map(r => r.STATUS);
+      let taskStatus = "Pending";
+
+      if (statuses.every(s => s === "Completed")) taskStatus = "Completed";
+      else if (statuses.some(s => s !== "Pending")) taskStatus = "Under_Development";
+
+      await connection.execute(
+        `
+        UPDATE TASKS
+        SET STATUS = :status
+        WHERE TASK_ID = :taskId
+        `,
+        {
+          status: taskStatus,
+          taskId: log.TASK_ID,
+        }
       );
 
       await connection.commit();
+
       res.json({ message: "Worklog updated successfully." });
-   
-  });
-});
+    });
+  }
+);
+
 
 
 router.delete(
@@ -942,25 +1053,36 @@ router.get(
         return res.json([]);
       }
 
-      const compQuery = `
-        SELECT
-          c.TASK_COMPONENT_ID,
-          c.TYPE,
-          c.TASK_ID,
-          c.COMPLEXITY,
-          c.COUNT,
-          c.HOURS_PER_ITEM,
-          c.TOTAL_COMP_HOURS,
-          c.STATUS,
-          (
-            SELECT NVL(SUM(wl.HOURS_LOGGED), 0)
-            FROM COMPONENT_WORKLOGS wl
-            WHERE wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
-            ${month && year ? "AND wl.LOG_DATE BETWEEN :startDate AND :endDate" : ""}
-          ) AS LOGGED_HOURS
-        FROM TASK_COMPONENTS c
-        WHERE c.TASK_ID IN (${taskIds.map((_, i) => `:tid${i}`).join(",")})
-      `;
+const compQuery = `
+  SELECT
+    c.TASK_COMPONENT_ID,
+    c.TYPE,
+    c.TASK_ID,
+    c.COMPLEXITY,
+    c.COUNT,
+    c.HOURS_PER_ITEM,
+    c.TOTAL_COMP_HOURS,
+    c.STATUS,
+
+    -- 🟢 Lifetime logged hours (ALL TIME)
+    (
+      SELECT NVL(SUM(wl.HOURS_LOGGED), 0)
+      FROM COMPONENT_WORKLOGS wl
+      WHERE wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
+    ) AS CUMULATIVE_LOGGED_HOURS,
+
+    -- 🔵 Month-specific logged hours (OPTIONAL, UI only)
+    (
+      SELECT NVL(SUM(wl.HOURS_LOGGED), 0)
+      FROM COMPONENT_WORKLOGS wl
+      WHERE wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
+      ${month && year ? "AND wl.LOG_DATE BETWEEN :startDate AND :endDate" : ""}
+    ) AS LOGGED_HOURS
+
+  FROM TASK_COMPONENTS c
+  WHERE c.TASK_ID IN (${taskIds.map((_, i) => `:tid${i}`).join(",")})
+`;
+
 
       const compBinds = taskIds.reduce(
         (acc, id, i) => ({ ...acc, [`tid${i}`]: id }),
@@ -1035,18 +1157,25 @@ router.get(
             }));
 
           return {
-            id: c.TASK_COMPONENT_ID,
-            type: c.TYPE,
-            complexity: c.COMPLEXITY,
-            count: c.COUNT,
-            status: c.STATUS,
-            hoursPerItem: c.HOURS_PER_ITEM,
-            totalCompHours: c.TOTAL_COMP_HOURS,
-            loggedHours: c.LOGGED_HOURS || 0,
-            hoursPerItemHHMM: formatHoursToHHMM(c.HOURS_PER_ITEM),
-            totalCompHoursHHMM: formatHoursToHHMM(c.TOTAL_COMP_HOURS),
-            worklogs: componentWorklogs,
-          };
+  id: c.TASK_COMPONENT_ID,
+  type: c.TYPE,
+  complexity: c.COMPLEXITY,
+  count: c.COUNT,
+  status: c.STATUS,
+  hoursPerItem: c.HOURS_PER_ITEM,
+  totalCompHours: c.TOTAL_COMP_HOURS,
+
+  // 🔵 current month
+  loggedHours: c.LOGGED_HOURS || 0,
+
+  // 🟢 lifetime (THIS is what analytics must use)
+  cumulativeLoggedHours: c.CUMULATIVE_LOGGED_HOURS || 0,
+
+  hoursPerItemHHMM: formatHoursToHHMM(c.HOURS_PER_ITEM),
+  totalCompHoursHHMM: formatHoursToHHMM(c.TOTAL_COMP_HOURS),
+  worklogs: componentWorklogs,
+};
+
         });
         return task;
       });
@@ -1216,43 +1345,53 @@ router.get(
         return res.json([]);
       }
 
-      let components = [];
       const compQuery = `
-        SELECT
-          c.TASK_COMPONENT_ID,
-          c.TYPE,
-          c.TASK_ID,
-          c.COMPLEXITY,
-          c.COUNT,
-          c.HOURS_PER_ITEM,
-          c.TOTAL_COMP_HOURS,
-          c.STATUS,
-          (
-            SELECT NVL(SUM(wl.HOURS_LOGGED), 0)
-            FROM COMPONENT_WORKLOGS wl
-            WHERE wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
-            ${month && year ? "AND wl.LOG_DATE BETWEEN :startDate AND :endDate" : ""}
-          ) AS LOGGED_HOURS
-        FROM TASK_COMPONENTS c
-        WHERE c.TASK_ID IN (${taskIds.map((_, i) => `:tid${i}`).join(",")})
-      `;
+  SELECT
+    c.TASK_COMPONENT_ID,
+    c.TYPE,
+    c.TASK_ID,
+    c.COMPLEXITY,
+    c.COUNT,
+    c.HOURS_PER_ITEM,
+    c.TOTAL_COMP_HOURS,
+    c.STATUS,
 
-      const compBinds = taskIds.reduce(
-        (acc, id, i) => ({ ...acc, [`tid${i}`]: id }),
-        {}
-      );
+    -- 🟢 Lifetime logged hours (ALL TIME)
+    (
+      SELECT NVL(SUM(wl.HOURS_LOGGED), 0)
+      FROM COMPONENT_WORKLOGS wl
+      WHERE wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
+    ) AS CUMULATIVE_LOGGED_HOURS,
 
-      if (month && year) {
-        const { start, end } = getMonthDateRange(Number(month), Number(year));
-        compBinds.startDate = start;
-        compBinds.endDate = end;
-      }
+    -- 🔵 Monthly logged hours (optional)
+    (
+      SELECT NVL(SUM(wl.HOURS_LOGGED), 0)
+      FROM COMPONENT_WORKLOGS wl
+      WHERE wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
+      ${month && year ? "AND wl.LOG_DATE BETWEEN :startDate AND :endDate" : ""}
+    ) AS LOGGED_HOURS
 
-      const compResult = await connection.execute(compQuery, compBinds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
+  FROM TASK_COMPONENTS c
+  WHERE c.TASK_ID IN (${taskIds.map((_, i) => `:tid${i}`).join(",")})
+`;
 
-      components = compResult.rows || [];
+const compBinds = taskIds.reduce(
+  (acc, id, i) => ({ ...acc, [`tid${i}`]: id }),
+  {}
+);
+
+if (month && year) {
+  const { start, end } = getMonthDateRange(Number(month), Number(year));
+  compBinds.startDate = start;
+  compBinds.endDate = end;
+}
+
+const compResult = await connection.execute(compQuery, compBinds, {
+  outFormat: oracledb.OUT_FORMAT_OBJECT,
+});
+
+const components = compResult.rows || [];
+
 
       // -------------------------------------------------------------------------
       // STEP 🔟 — Fetch worklogs safely
@@ -1297,34 +1436,43 @@ router.get(
       // -------------------------------------------------------------------------
       // STEP 1️⃣1️⃣ — Attach components + worklogs to tasks
       // -------------------------------------------------------------------------
-      tasks = tasks.map((task) => {
-        const taskComps = components.filter((c) => c.TASK_ID === task.taskId);
-        task.components = taskComps.map((c) => {
-          const componentWorklogs = worklogs
-            .filter((wl) => wl.TASK_COMPONENT_ID === c.TASK_COMPONENT_ID)
-            .map((wl) => ({
-              logDate: wl.LOG_DATE,
-              hoursLogged: wl.HOURS_LOGGED,
-              hoursLoggedHHMM: formatHoursToHHMM(wl.HOURS_LOGGED),
-              notes: wl.NOTES,
-            }));
+     tasks = tasks.map((task) => {
+  const taskComps = components.filter((c) => c.TASK_ID === task.taskId);
 
-          return {
-            id: c.TASK_COMPONENT_ID,
-            type: c.TYPE,
-            complexity: c.COMPLEXITY,
-            count: c.COUNT,
-            status: c.STATUS,
-            hoursPerItem: c.HOURS_PER_ITEM,
-            totalCompHours: c.TOTAL_COMP_HOURS,
-            loggedHours: c.LOGGED_HOURS || 0,
-            hoursPerItemHHMM: formatHoursToHHMM(c.HOURS_PER_ITEM),
-            totalCompHoursHHMM: formatHoursToHHMM(c.TOTAL_COMP_HOURS),
-            worklogs: componentWorklogs,
-          };
-        });
-        return task;
-      });
+  task.components = taskComps.map((c) => {
+    const componentWorklogs = worklogs
+      .filter((wl) => wl.TASK_COMPONENT_ID === c.TASK_COMPONENT_ID)
+      .map((wl) => ({
+        logDate: wl.LOG_DATE,
+        hoursLogged: wl.HOURS_LOGGED,
+        hoursLoggedHHMM: formatHoursToHHMM(wl.HOURS_LOGGED),
+        notes: wl.NOTES,
+      }));
+
+    return {
+      id: c.TASK_COMPONENT_ID,
+      type: c.TYPE,
+      complexity: c.COMPLEXITY,
+      count: c.COUNT,
+      status: c.STATUS,
+      hoursPerItem: c.HOURS_PER_ITEM,
+      totalCompHours: c.TOTAL_COMP_HOURS,
+
+      // 🔵 current month (UI only)
+      loggedHours: c.LOGGED_HOURS || 0,
+
+      // 🟢 lifetime (analytics MUST use this)
+      cumulativeLoggedHours: c.CUMULATIVE_LOGGED_HOURS || 0,
+
+      hoursPerItemHHMM: formatHoursToHHMM(c.HOURS_PER_ITEM),
+      totalCompHoursHHMM: formatHoursToHHMM(c.TOTAL_COMP_HOURS),
+      worklogs: componentWorklogs,
+    };
+  });
+
+  return task;
+});
+ 
 
       // -------------------------------------------------------------------------
       // ✅ Final Safe Response
@@ -1338,9 +1486,9 @@ router.get(
 // PATCH task (update)
 router.patch(
   "/:id",
-  authMiddleware(["admin", "manager", "employee","alt", "lt", "head_lt"]),async (req, res) => {
-      return safeRoute(req, res, async (connection) => {
-
+  authMiddleware(["admin", "manager", "employee", "alt", "lt", "head_lt"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (connection) => {
       const user = req.user;
       const taskId = Number(req.params.id);
 
@@ -1372,7 +1520,6 @@ router.patch(
       const isManagerOfTask = emp?.MANAGER_ID === user.id;
       const isTaskOwner = task.E_ID === user.id;
 
-      // 🔒 Strict access control
       if (user.role === "employee" && !isTaskOwner) {
         return res.status(403).json({ error: "Access denied" });
       }
@@ -1386,22 +1533,19 @@ router.patch(
       }
 
       // -------------------------------------------------------------------------
-      // STEP 3️⃣ — Prepare data
+      // STEP 3️⃣ — Prepare update payload
       // -------------------------------------------------------------------------
       let updateData = { ...req.body };
-
+      console.log("Update Data:", updateData);
       // -------------------------------------------------------------------------
-      // STEP 4️⃣ — Handle component updates safely
+      // STEP 4️⃣ — Handle component updates
       // -------------------------------------------------------------------------
       if (Array.isArray(req.body.components)) {
-        const { workloadHours, processedComponents } = await calculateWorkload(
-          req.body.components,
-          connection
-        );
+        const { workloadHours, processedComponents } =
+          await calculateWorkload(req.body.components, connection);
 
         updateData.WORKLOAD_HOURS = workloadHours;
 
-        // Get current components
         const existingCompsResult = await connection.execute(
           `SELECT TASK_COMPONENT_ID FROM TASK_COMPONENTS WHERE TASK_ID = :taskId`,
           { taskId },
@@ -1411,6 +1555,7 @@ router.patch(
         const existingCompIds = existingCompsResult.rows.map((r) =>
           r.TASK_COMPONENT_ID.toString()
         );
+
         const incomingCompIds = [];
 
         for (const comp of processedComponents) {
@@ -1428,52 +1573,58 @@ router.patch(
           };
 
           if (compId && existingCompIds.includes(compId.toString())) {
-            // --- UPDATE existing ---
             incomingCompIds.push(compId.toString());
 
             await connection.execute(
-              `UPDATE TASK_COMPONENTS SET
-                 TYPE = :type,
-                 COMPLEXITY = :complexity,
-                 COUNT = :count,
-                 HOURS_PER_ITEM = :hoursPerItem,
-                 TOTAL_COMP_HOURS = :totalCompHours,
-                 FILE_REQUIRED = :fileRequired,
-                 FILE_TYPE = :fileType,
-                 UPDATED_AT = SYSTIMESTAMP
-               WHERE TASK_COMPONENT_ID = :compId AND TASK_ID = :taskId`,
+              `
+              UPDATE TASK_COMPONENTS SET
+                TYPE = :type,
+                COMPLEXITY = :complexity,
+                COUNT = :count,
+                HOURS_PER_ITEM = :hoursPerItem,
+                TOTAL_COMP_HOURS = :totalCompHours,
+                FILE_REQUIRED = :fileRequired,
+                FILE_TYPE = :fileType,
+                UPDATED_AT = SYSTIMESTAMP
+              WHERE TASK_COMPONENT_ID = :compId
+                AND TASK_ID = :taskId
+              `,
               { ...bindData, compId },
               { autoCommit: false }
             );
           } else {
-            // --- INSERT new ---
             await connection.execute(
-              `INSERT INTO TASK_COMPONENTS 
-                 (TASK_ID, TYPE, COMPLEXITY, COUNT, HOURS_PER_ITEM, TOTAL_COMP_HOURS, FILE_REQUIRED, FILE_TYPE)
-               VALUES (:taskId, :type, :complexity, :count, :hoursPerItem, :totalCompHours, :fileRequired, :fileType)`,
+              `
+              INSERT INTO TASK_COMPONENTS
+                (TASK_COMPONENT_ID, TASK_ID, TYPE, COMPLEXITY, COUNT,
+                 HOURS_PER_ITEM, TOTAL_COMP_HOURS, FILE_REQUIRED, FILE_TYPE)
+              VALUES
+                (SEQ_TASK_COMPONENT.NEXTVAL, :taskId, :type, :complexity,
+                 :count, :hoursPerItem, :totalCompHours, :fileRequired, :fileType)
+              `,
               bindData,
               { autoCommit: false }
             );
           }
         }
 
-        // --- DELETE removed components ---
         const compIdsToDelete = existingCompIds.filter(
           (id) => !incomingCompIds.includes(id)
         );
 
-        if (compIdsToDelete.length > 0) {
+        if (compIdsToDelete.length) {
           const deleteBinds = { taskId };
-          const deletePlaceholders = compIdsToDelete.map((id, i) => {
-            const bindName = `delId${i}`;
-            deleteBinds[bindName] = id;
-            return `:${bindName}`;
+          const placeholders = compIdsToDelete.map((id, i) => {
+            deleteBinds[`id${i}`] = id;
+            return `:id${i}`;
           });
 
           await connection.execute(
-            `DELETE FROM TASK_COMPONENTS 
-             WHERE TASK_ID = :taskId 
-               AND TASK_COMPONENT_ID IN (${deletePlaceholders.join(",")})`,
+            `
+            DELETE FROM TASK_COMPONENTS
+            WHERE TASK_ID = :taskId
+              AND TASK_COMPONENT_ID IN (${placeholders.join(",")})
+            `,
             deleteBinds,
             { autoCommit: false }
           );
@@ -1481,70 +1632,82 @@ router.patch(
 
         await connection.commit();
       }
+      const fieldMap = {
+  employeeId: "E_ID",
+  projectId: "PROJECT_ID",
+  moduleId: "MODULE_ID",
+  title: "TITLE",
+  description: "DESCRIPTION",
+  dueDate: "DUE_DATE",
+  priority: "PRIORITY",
+  status: "STATUS",
+  WORKLOAD_HOURS: "WORKLOAD_HOURS",
+  completedAt: "COMPLETED_AT",
+};
 
       // -------------------------------------------------------------------------
-      // STEP 5️⃣ — Update task details
+      // STEP 5️⃣ — FIXED normal task update (this was the bug)
       // -------------------------------------------------------------------------
-      const taskTableColumns = [
-        "E_ID",
-        "PROJECT_ID",
-        "MODULE_ID",
-        "TITLE",
-        "DESCRIPTION",
-        "DUE_DATE",
-        "PRIORITY",
-        "STATUS",
-        "WORKLOAD_HOURS",
-        "COMPLETED_AT",
-      ];
-
       const setClauses = [];
-      const binds = { taskId };
+const binds = { taskId };
 
-      Object.keys(updateData).forEach((key) => {
-        const upperKey = key.toUpperCase();
-        if (taskTableColumns.includes(upperKey)) {
-          setClauses.push(`${upperKey} = :${key}`);
-          binds[key] = updateData[key];
-        }
-      });
+// normalize dates
+if (updateData.dueDate) {
+  updateData.dueDate = new Date(updateData.dueDate);
+}
+if (updateData.completedAt) {
+  updateData.completedAt = new Date(updateData.completedAt);
+}
 
-      setClauses.push("UPDATED_AT = SYSTIMESTAMP");
-      const updateSQL = `UPDATE TASKS SET ${setClauses.join(
-        ", "
-      )} WHERE TASK_ID = :taskId`;
+Object.entries(updateData).forEach(([key, value]) => {
+  const dbColumn = fieldMap[key] || fieldMap[key.toUpperCase()];
+  if (!dbColumn) return;
 
-      await connection.execute(updateSQL, binds, { autoCommit: true });
+  setClauses.push(`${dbColumn} = :${key}`);
+  binds[key] = value;
+});
+
+setClauses.push("UPDATED_AT = SYSTIMESTAMP");
+
+if (setClauses.length === 1) {
+  return res.status(400).json({ error: "No valid task fields to update" });
+}
+
+const updateSQL = `
+  UPDATE TASKS
+  SET ${setClauses.join(", ")}
+  WHERE TASK_ID = :taskId
+`;
+
+await connection.execute(updateSQL, binds, { autoCommit: true });
+
 
       // -------------------------------------------------------------------------
-      // STEP 6️⃣ — Fetch updated task details (with joins)
+      // STEP 6️⃣ — Fetch updated task
       // -------------------------------------------------------------------------
       const updatedTaskResult = await connection.execute(
         `
         SELECT 
           t.*, 
-          e.NAME AS EMPLOYEE_NAME, 
+          e.NAME AS EMPLOYEE_NAME,
           e.DESIGNATION AS EMPLOYEE_DESIGNATION,
-          m.NAME AS MODULE_NAME, 
+          m.NAME AS MODULE_NAME,
           p.NAME AS PROJECT_NAME
         FROM TASKS t
         LEFT JOIN EMPLOYEES e ON t.E_ID = e.ID
         LEFT JOIN MODULES m ON t.MODULE_ID = m.ID
         LEFT JOIN PROJECTS p ON t.PROJECT_ID = p.ID
         WHERE t.TASK_ID = :taskId
-      `,
+        `,
         { taskId },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
-
-      // ✅ Final response
-      if (!updatedTaskResult.rows.length) {
-        return res.json({ message: "Task updated successfully" });
-      }
-
+      console.log("Updated Task:", updatedTaskResult.rows[0]);
       res.json(formatTaskDates(updatedTaskResult.rows[0]));
-     });
-});
+    });
+  }
+);
+
 
 
 router.patch(

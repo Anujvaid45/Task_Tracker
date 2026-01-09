@@ -886,17 +886,61 @@ router.delete("/skill/:id", authMiddleware(["head_lt", "lt", "alt", "admin", "ma
 // --------------------
 // Application lists per-role
 // --------------------
-router.get("/applications", authMiddleware(["manager"]), async (req, res) => {
-  return safeRoute(req, res, async (conn) => {
-    const result = await conn.execute(
-      `SELECT DISTINCT application_name FROM employees WHERE manager_id = :managerId`,
-      { managerId: req.user.id },
-      { outFormat: oracledb.OUT_FORMAT_OBJECT }
-    );
-    return res.json(result.rows.map((r) => r.APPLICATION_NAME));
-  });
-});
 
+// Helper to split, trim and dedupe comma-separated app names
+function extractUniqueApps(rows, columnName = "APPLICATION_NAME") {
+  const seen = new Map(); // key = lowercased name -> original-case name
+  for (const r of rows) {
+    const val = r[columnName];
+    if (!val) continue;
+    // split on comma, also tolerate other separators (strict comma here)
+    val.split(",").forEach((raw) => {
+      const trimmed = raw.trim();
+      if (!trimmed) return;
+      const key = trimmed.toLowerCase();
+      if (!seen.has(key)) seen.set(key, trimmed);
+    });
+  }
+  // return sorted array (case-insensitive)
+  return Array.from(seen.values()).sort((a, b) =>
+    a.toLowerCase().localeCompare(b.toLowerCase())
+  );
+}
+
+// Manager scoped
+router.get(
+  "/applications",
+  authMiddleware(["manager"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (conn) => {
+      // 1) apps from employees under this manager
+      const underRes = await conn.execute(
+        `SELECT DISTINCT application_name FROM employees WHERE manager_id = :managerId`,
+        { managerId: req.user.id },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      // 2) apps recorded on manager's own row (if any)
+      const selfRes = await conn.execute(
+        `SELECT application_name FROM employees WHERE id = :managerId`,
+        { managerId: req.user.id },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      // combine rows from both queries
+      const combinedRows = [
+        ...(underRes.rows || []),
+        ...(selfRes.rows || [])
+      ];
+
+      const apps = extractUniqueApps(combinedRows, "APPLICATION_NAME");
+
+      return res.json(apps);
+    });
+  }
+);
+
+// ALT scoped
 router.get("/applications/alt", authMiddleware(["alt"]), async (req, res) => {
   return safeRoute(req, res, async (conn) => {
     const result = await conn.execute(
@@ -904,10 +948,13 @@ router.get("/applications/alt", authMiddleware(["alt"]), async (req, res) => {
       { altId: req.user.id },
       { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
-    return res.json(result.rows.map((r) => r.APPLICATION_NAME));
+
+    const apps = extractUniqueApps(result.rows);
+    return res.json(apps);
   });
 });
 
+// LT scoped
 router.get("/applications/lt", authMiddleware(["lt"]), async (req, res) => {
   return safeRoute(req, res, async (conn) => {
     const result = await conn.execute(
@@ -915,20 +962,26 @@ router.get("/applications/lt", authMiddleware(["lt"]), async (req, res) => {
       { ltId: req.user.id },
       { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
-    return res.json(result.rows.map((r) => r.APPLICATION_NAME));
+
+    const apps = extractUniqueApps(result.rows);
+    return res.json(apps);
   });
 });
 
+// Head_LT / all scoped
 router.get("/applications/all", authMiddleware(["head_lt"]), async (req, res) => {
   return safeRoute(req, res, async (conn) => {
     const result = await conn.execute(
-      `SELECT DISTINCT application_name FROM employees ORDER BY application_name`,
+      `SELECT DISTINCT application_name FROM employees WHERE application_name IS NOT NULL`,
       {},
       { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
-    return res.json(result.rows.map((r) => r.APPLICATION_NAME));
+
+    const apps = extractUniqueApps(result.rows);
+    return res.json(apps);
   });
 });
+
 
 // --------------------
 // Hierarchy endpoint (for selects)
