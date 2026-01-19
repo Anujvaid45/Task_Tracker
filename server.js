@@ -1,49 +1,10 @@
-// require('dotenv').config()
-// const express = require('express')
-// const mongoose = require('mongoose')
-// const cors = require('cors')
-// const employeeRoutes = require('./routes/employeeRoutes.js')
-// const taskRoutes = require('./routes/taskRoutes.js')
-// const dashboardRoutes = require('./routes/dashboardRoutes.js')
-// const authRoutes = require('./routes/authRoutes.js')
-// const attendanceRoutes = require('./routes/attendanceRoutes.js')
-// const moduleRoutes = require('./routes/moduleRoutes.js')
-// const projectRoutes = require('./routes/projectRoutes.js')
-// const componentsRoutes = require('./routes/componentsRoutes.js')
-// const teamRoutes = require('./routes/TeamRoutes.js')
-// const app = express();
-
-// app.use(cors());
-// app.use(express.json());
-
-// app.use("/api/employees", employeeRoutes);
-// app.use("/api/modules", moduleRoutes);
-// app.use("/api/projects", projectRoutes);
-// app.use("/api/tasks", taskRoutes);
-// app.use("/api/dashboard", dashboardRoutes);
-// app.use("/api/auth", authRoutes);
-// app.use("/api/attendance", attendanceRoutes);
-// app.use("/api/components", componentsRoutes);
-// app.use("/api/teams", teamRoutes);
-
-
-// // MongoDB connection
-// mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-//   .then(() => console.log("MongoDB connected"))
-//   .catch(err => console.log(err));
-
-// // test route
-// app.get("/", (req, res) => res.send("API running"));
-
-// const PORT = process.env.PORT || 5000;
-// app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const oracledb = require('oracledb');
 const path = require("path");
 
+oracledb.fetchAsString = [ oracledb.DATE ];
 
 // Import routes
 const employeeRoutes = require('./routes/employeeRoutes.js');
@@ -56,6 +17,7 @@ const projectRoutes = require('./routes/projectRoutes.js');
 const componentsRoutes = require('./routes/componentsRoutes.js');
 const teamRoutes = require('./routes/TeamRoutes.js');
 const docRoutes = require('./routes/docLib.js')
+
 const app = express();
 
 // Middlewares
