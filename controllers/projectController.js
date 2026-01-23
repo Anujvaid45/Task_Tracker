@@ -484,7 +484,9 @@ exports.updateProject = async (req, res) => {
     const managerId = req.user.managerId || req.user.id;
     const projectId = req.params.id;
 
-    // Get updater name
+    // --------------------------------------------------
+    // Fetch updater name
+    // --------------------------------------------------
     const userResult = await connection.execute(
       `SELECT name FROM employees WHERE id = :id`,
       { id: req.user.id },
@@ -492,49 +494,68 @@ exports.updateProject = async (req, res) => {
     );
     const updatedBy = userResult.rows[0]?.NAME || `User-${req.user.id}`;
 
-    // Fetch current project
-    const result = await connection.execute(
+    // --------------------------------------------------
+    // Fetch existing project
+    // --------------------------------------------------
+    const projectResult = await connection.execute(
       `SELECT * FROM projects WHERE id = :id AND manager_id = :managerId`,
       { id: projectId, managerId },
       { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
 
-    if (!result.rows?.length) {
+    if (!projectResult.rows?.length) {
       return res.status(404).json({ error: "Project not found or access denied" });
     }
 
-    const currentProject = result.rows[0];
+    const currentProject = projectResult.rows[0];
 
+    // --------------------------------------------------
+    // Utilities
+    // --------------------------------------------------
     const parseDate = (d) => {
       if (!d) return null;
-      const dateObj = new Date(d);
-      if (isNaN(dateObj.getTime())) return null;
-      return new Date(Date.UTC(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate()));
+      const date = new Date(d);
+      if (isNaN(date.getTime())) return null;
+      date.setHours(0, 0, 0, 0);
+      return date;
     };
 
-    const todayUTC = new Date();
-    todayUTC.setHours(0, 0, 0, 0);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    const computeOnTrackStatus = (plannedEndDate) => {
-  if (!plannedEndDate) return "On Track";
+    const computeOnTrackStatus = (plannedEnd) => {
+      if (!plannedEnd) return "On Track";
+      const planned = new Date(plannedEnd);
+      planned.setHours(0, 0, 0, 0);
+      return today > planned ? "Delayed" : "On Track";
+    };
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+    const parseClobJson = async (clob) => {
+      if (!clob) return [];
+      try {
+        if (clob instanceof oracledb.Lob) {
+          let data = "";
+          clob.setEncoding("utf8");
+          for await (const chunk of clob) data += chunk;
+          return JSON.parse(data);
+        }
+        return JSON.parse(clob);
+      } catch {
+        return [];
+      }
+    };
 
-  const planned = new Date(plannedEndDate);
-  planned.setHours(0, 0, 0, 0);
-
-  return today > planned ? "Delayed" : "On Track";
-};
-
-
-    // --- Allowed fields ---
+    // --------------------------------------------------
+    // Allowed fields
+    // --------------------------------------------------
     const allowedFields = {
       module_id: req.body.moduleId ?? currentProject.MODULE_ID,
       name: req.body.name ?? currentProject.NAME,
       description: req.body.description ?? currentProject.DESCRIPTION,
       start_date: req.body.startDate ? parseDate(req.body.startDate) : currentProject.START_DATE,
-      planned_end_date: req.body.plannedEndDate ? parseDate(req.body.plannedEndDate) : currentProject.PLANNED_END_DATE,
+      planned_end_date: req.body.plannedEndDate
+        ? parseDate(req.body.plannedEndDate)
+        : currentProject.PLANNED_END_DATE,
       priority: req.body.priority ?? currentProject.PRIORITY,
       project_stage: req.body.projectStage ?? currentProject.PROJECT_STAGE,
       days: req.body.days ?? currentProject.DAYS,
@@ -549,135 +570,86 @@ exports.updateProject = async (req, res) => {
       brs_filename: req.body.brsFilename ?? currentProject.BRS_FILENAME,
       project_cost: req.body.projectCost ?? currentProject.PROJECT_COST,
       remarks: req.body.remarks ?? currentProject.REMARKS,
-      discussion_delay_reason: req.body.discussionDelayReason ?? currentProject.DISCUSSION_DELAY_REASON,
+      discussion_delay_reason:
+        req.body.discussionDelayReason ?? currentProject.DISCUSSION_DELAY_REASON,
       team: req.body.team ?? currentProject.TEAM,
     };
 
-    // ---------------- Stage logic ----------------
-    const stages = [
-      "BRS_Discussion", "Approach_Preparation", "Approach_Finalization",
-      "Under_Development", "Under_QA", "Under_UAT",
-      "UAT_Signoff", "Under_Preprod", "Preprod_Signoff", "Live"
-    ];
+    // --------------------------------------------------
+    // Auto compute on_track_status on EVERY edit
+    // --------------------------------------------------
+    allowedFields.on_track_status = computeOnTrackStatus(
+      allowedFields.planned_end_date
+    );
 
-    const oldStageIndex = stages.indexOf(currentProject.PROJECT_STAGE);
-    const newStageIndex = stages.indexOf(allowedFields.project_stage);
+// --------------------------------------------------
+// --------------------------------------------------
+// PROJECT_CHANGES_RECEIVED (MERGE, NOT OVERWRITE)
+// --------------------------------------------------
 
-    // Sprint dates
-    if (newStageIndex >= stages.indexOf("Under_Development")) {
-      allowedFields.sprint_start_date =
-        currentProject.SPRINT_START_DATE || (allowedFields.project_stage === "Under_Development" ? todayUTC : null);
-
-      allowedFields.sprint_end_date =
-        currentProject.PROJECT_STAGE === "Under_Development" && newStageIndex > oldStageIndex
-          ? todayUTC
-          : currentProject.SPRINT_END_DATE || null;
-    } else {
-      allowedFields.sprint_start_date = null;
-      allowedFields.sprint_end_date = null;
-    }
-
-    // UAT release date
-    const uatIndex = stages.indexOf("UAT_Signoff");
-    allowedFields.uat_release_date =
-      oldStageIndex < uatIndex && newStageIndex >= uatIndex
-        ? currentProject.UAT_RELEASE_DATE || todayUTC
-        : newStageIndex < uatIndex
-        ? null
-        : currentProject.UAT_RELEASE_DATE;
-
-    // Go live
-    const liveIndex = stages.indexOf("Live");
-    allowedFields.go_live_end_date =
-      oldStageIndex < liveIndex && newStageIndex >= liveIndex
-        ? currentProject.GO_LIVE_END_DATE || todayUTC
-        : newStageIndex < liveIndex
-        ? null
-        : currentProject.GO_LIVE_END_DATE;
-
-    // Man days
-    allowedFields.man_days =
-      allowedFields.start_date && allowedFields.planned_end_date
-        ? await calculateManDays(allowedFields.start_date, allowedFields.planned_end_date)
-        : currentProject.MAN_DAYS;
-
-allowedFields.on_track_status = computeOnTrackStatus(
-  allowedFields.planned_end_date
+// 1️⃣ Read existing DB changes
+let existingChanges = await parseClobJson(
+  currentProject.PROJECT_CHANGES_RECEIVED
 );
 
-    // --- Determine changes ---
+// 2️⃣ Read incoming changes from frontend
+let incomingChanges = Array.isArray(req.body.projectChangesReceived)
+  ? req.body.projectChangesReceived
+  : [];
+
+// 3️⃣ Normalize incoming entries
+incomingChanges = incomingChanges.map((c) => ({
+  date: c.date,
+  stage: c.stage,
+  details: c.details,
+  updatedBy,
+  timestamp: c.timestamp || new Date().toISOString(),
+}));
+
+// 4️⃣ Merge (append new → keep old)
+const mergedChanges = [...existingChanges, ...incomingChanges];
+
+// 5️⃣ Store
+const finalProjectChangesReceived =
+  mergedChanges.length > 0 ? JSON.stringify(mergedChanges) : null;
+
+    // --------------------------------------------------
+    // Compute change_log (system audit)
+    // --------------------------------------------------
     const changes = {};
     for (const [key, newValue] of Object.entries(allowedFields)) {
       const oldValue = currentProject[key.toUpperCase()];
-
-      const oldNorm = oldValue == null || oldValue === "" ? null : oldValue;
-      const newNorm = newValue == null || newValue === "" ? null : newValue;
+      const oldNorm = oldValue ?? null;
+      const newNorm = newValue ?? null;
 
       const isDate =
-        oldNorm instanceof Date || newNorm instanceof Date ||
-        (typeof oldNorm === "string" && !isNaN(Date.parse(oldNorm))) ||
-        (typeof newNorm === "string" && !isNaN(Date.parse(newNorm)));
+        oldNorm instanceof Date ||
+        newNorm instanceof Date ||
+        (!isNaN(Date.parse(oldNorm)) && !isNaN(Date.parse(newNorm)));
 
-      let different = false;
-      if (isDate) {
-        const oldTime = oldNorm ? new Date(oldNorm).getTime() : null;
-        const newTime = newNorm ? new Date(newNorm).getTime() : null;
-        different = oldTime !== newTime;
-      } else {
-        different = oldNorm !== newNorm;
-      }
+      const different = isDate
+        ? new Date(oldNorm || 0).getTime() !== new Date(newNorm || 0).getTime()
+        : oldNorm !== newNorm;
 
       if (different) {
         changes[key] = { old: oldNorm, new: newNorm };
       }
     }
 
-    // --- Handle cumulative change_log ---
-let existingLog = [];
-
-// Handle CLOB or string
-if (currentProject.CHANGE_LOG) {
-  try {
-    let logData = null;
-
-    if (currentProject.CHANGE_LOG instanceof oracledb.Lob) {
-      logData = await new Promise((resolve, reject) => {
-        let data = '';
-        currentProject.CHANGE_LOG.setEncoding('utf8');
-        currentProject.CHANGE_LOG.on('data', chunk => { data += chunk; });
-        currentProject.CHANGE_LOG.on('end', () => resolve(data));
-        currentProject.CHANGE_LOG.on('error', err => reject(err));
+    let changeLog = await parseClobJson(currentProject.CHANGE_LOG);
+    if (Object.keys(changes).length) {
+      changeLog.push({
+        timestamp: new Date(),
+        updatedBy,
+        changes,
       });
-    } else {
-      logData = currentProject.CHANGE_LOG;
     }
 
-    // Parse JSON
-    const parsed = JSON.parse(logData);
-
-    // Ensure it is an array
-    existingLog = Array.isArray(parsed) ? parsed : [parsed];
-
-  } catch (err) {
-    console.error("Failed to parse existing change_log:", err);
-    existingLog = [];
-  }
-}
-
-// Now you can safely push
-if (Object.keys(changes).length > 0) {
-  existingLog.push({
-    timestamp: new Date(),
-    updatedBy,
-    changes
-  });
-}
-
-const finalChangeLog = existingLog.length > 0 ? JSON.stringify(existingLog) : null;
-
-
-    // --- Update query ---
-    const updateQuery = `
+    // --------------------------------------------------
+    // UPDATE PROJECT
+    // --------------------------------------------------
+    await connection.execute(
+      `
       UPDATE projects SET
         module_id = :module_id,
         name = :name,
@@ -700,55 +672,48 @@ const finalChangeLog = existingLog.length > 0 ? JSON.stringify(existingLog) : nu
         remarks = :remarks,
         discussion_delay_reason = :discussion_delay_reason,
         team = :team,
-        sprint_start_date = :sprint_start_date,
-        sprint_end_date = :sprint_end_date,
-        uat_release_date = :uat_release_date,
-        go_live_end_date = :go_live_end_date,
-        man_days = :man_days,
         on_track_status = :on_track_status,
+        project_changes_received = :project_changes_received,
         updated_at = SYSTIMESTAMP,
         updated_by = :updated_by,
         change_log = :change_log
       WHERE id = :id AND manager_id = :managerId
-    `;
-
-    await connection.execute(
-      updateQuery,
+      `,
       {
         ...allowedFields,
+        project_changes_received: finalProjectChangesReceived,
+        change_log: changeLog.length ? JSON.stringify(changeLog) : null,
+        updated_by: updatedBy,
         id: projectId,
         managerId,
-        updated_by: updatedBy,
-        change_log: finalChangeLog
       },
       { autoCommit: true }
     );
 
+    // --------------------------------------------------
     // Fetch updated project
-    const updatedProjectResult = await connection.execute(
+    // --------------------------------------------------
+    const updated = await connection.execute(
       `SELECT * FROM projects WHERE id = :id`,
       { id: projectId },
       { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
 
-    const updatedProject = updatedProjectResult.rows[0];
-    const formattedProject = formatProjectDates(updatedProject);
-
     res.json({
       message: "Project updated successfully",
-      project: formattedProject,
+      project: updated.rows[0],
       updatedBy,
-      changes
+      changes,
     });
+
   } catch (err) {
-    console.error("Failed to update project:", err);
+    console.error(err);
     res.status(400).json({ error: err.message });
   } finally {
-    if (connection) {
-      try { await connection.close(); } catch (err) { console.error(err); }
-    }
+    if (connection) await connection.close();
   }
 };
+
 
 // Delete Project
 exports.deleteProject = async (req, res) => {
