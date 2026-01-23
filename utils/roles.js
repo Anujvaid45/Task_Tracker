@@ -2,8 +2,9 @@
 const ROLE = {
   HEAD: "head_lt",
   LT: "lt",
-  MANAGER: "manager", // ALT
-  ADMIN: "admin",     // TL
+  ALT: "alt",
+  MANAGER: "manager", 
+  ADMIN: "admin",     
   EMPLOYEE: "employee",
 };
 
