@@ -17,7 +17,7 @@ const projectRoutes = require('./routes/projectRoutes.js');
 const componentsRoutes = require('./routes/componentsRoutes.js');
 const teamRoutes = require('./routes/TeamRoutes.js');
 const docRoutes = require('./routes/docLib.js')
-
+const liveIssueRoutes = require('./routes/liveIssueRoutes.js');
 const app = express();
 
 // Middlewares
@@ -29,6 +29,7 @@ app.use("/api/employees", employeeRoutes);
 app.use("/api/modules", moduleRoutes);
 app.use("/api/projects", projectRoutes);
 app.use("/api/tasks", taskRoutes);
+app.use("/api/live-issues", liveIssueRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/attendance", attendanceRoutes);
