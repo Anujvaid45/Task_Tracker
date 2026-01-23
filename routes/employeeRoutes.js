@@ -5,7 +5,7 @@ const bcrypt = require('bcryptjs');
 const { safeRoute } = require("../utils/dbWrapper"); // uses conn = pooled connection and closes it
 const { buildVisibilityOracle } = require("../utils/visibilityOracle");
 
-const router = express.Router();
+const router = express.Router(); 
 
 // Helper function to execute queries
 async function executeQuery(query, binds = [], options = {}) {
@@ -20,13 +20,7 @@ async function executeQuery(query, binds = [], options = {}) {
   }
 }
 
-
-
-
-
-// --------------------
 // Helpers
-// --------------------
 function camelCase(str) {
   return String(str || "")
     .toLowerCase()
@@ -53,9 +47,7 @@ function formatDateForDisplay(d) {
   }
 }
 
-// --------------------
 // CREATE Employee
-// --------------------
 router.post(
   "/",
   authMiddleware(["head_lt", "lt", "alt", "admin", "manager"]),
@@ -124,7 +116,6 @@ router.post(
 
       if (creator.role === "manager") {
         managerIdToAssign = creator.id;
-        console.log(managerIdToAssign,"hehe")
 
       } else if (creator.role === "admin") {
         if (role !== "employee")
@@ -233,10 +224,7 @@ if (creator.role === "manager" && Number(reportingManager) === creator.id) {
   }
 );
 
-
-// --------------------
 // GET Employees
-// --------------------
 router.get(
   "/",
   authMiddleware(["head_lt", "lt", "alt", "admin", "manager", "employee"]),
@@ -271,6 +259,8 @@ router.get(
             }))
           );
         }
+        // 🔍 DEBUG: log final SQL + binds
+
 
         // -------------------------------------------------------
         // 2️⃣ Universal employee visibility query
@@ -282,7 +272,6 @@ router.get(
           ${sqlCondition}   -- LT/ALT/MANAGER/TL visibility rules
           ORDER BY e.name
         `;
-
         const result = await conn.execute(sql, binds, {
           outFormat: oracledb.OUT_FORMAT_OBJECT,
         });
@@ -371,7 +360,6 @@ router.get(
             ),
           };
         });
-        console.log("GET /employees returned", employees);
         return res.json(employees);
       } catch (err) {
         console.error("GET /employees failed:", err);
@@ -381,10 +369,7 @@ router.get(
   }
 );
 
-
-// --------------------
 // DELETE Employee
-// --------------------
 router.delete(
   "/:id",
   authMiddleware(["head_lt", "lt", "alt", "admin", "manager"]),
@@ -484,10 +469,7 @@ router.delete(
   }
 );
 
-
-// --------------------
 // UPDATE Employee
-// --------------------
 router.put(
   "/:id",
   authMiddleware(["head_lt", "lt", "alt", "admin", "manager", "employee"]),
@@ -685,10 +667,7 @@ router.put(
   }
 );
 
-
-// --------------------
 // GET /employees/reporting-managers
-// --------------------
 router.get("/reporting-managers", authMiddleware(["admin", "manager"]), async (req, res) => {
   try {
     const creator = req.user; // { id, role, managerId }
@@ -784,10 +763,7 @@ router.get("/reporting-managers", authMiddleware(["admin", "manager"]), async (r
   }
 });
 
-
-// --------------------
 // GET /employees/team-leads
-// --------------------
 router.get("/team-leads", authMiddleware(["head_lt", "lt", "alt", "admin", "manager"]), async (req, res) => {
   return safeRoute(req, res, async (conn) => {
     try {
@@ -816,9 +792,7 @@ router.get("/team-leads", authMiddleware(["head_lt", "lt", "alt", "admin", "mana
   });
 });
 
-// --------------------
 // GET /employees/all
-// --------------------
 router.get("/all", async (req, res) => {
   return safeRoute(req, res, async (conn) => {
     const result = await conn.execute(
@@ -830,9 +804,7 @@ router.get("/all", async (req, res) => {
   });
 });
 
-// --------------------
 // Skills CRUD
-// --------------------
 router.post("/skill", authMiddleware(["head_lt", "lt", "alt", "admin", "manager"]), async (req, res) => {
   return safeRoute(req, res, async (conn) => {
     const { skill_name, skill_description } = req.body;
@@ -883,10 +855,7 @@ router.delete("/skill/:id", authMiddleware(["head_lt", "lt", "alt", "admin", "ma
   });
 });
 
-// --------------------
 // Application lists per-role
-// --------------------
-
 // Helper to split, trim and dedupe comma-separated app names
 function extractUniqueApps(rows, columnName = "APPLICATION_NAME") {
   const seen = new Map(); // key = lowercased name -> original-case name
@@ -981,11 +950,61 @@ router.get("/applications/all", authMiddleware(["head_lt"]), async (req, res) =>
     return res.json(apps);
   });
 });
+router.get(
+  "/applications/employee",
+  authMiddleware(["employee"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (conn) => {
+      // 1️⃣ Fetch applications assigned to this employee
+      const result = await conn.execute(
+        `
+        SELECT application_name
+        FROM employees
+        WHERE id = :employeeId
+        `,
+        { employeeId: req.user.id },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
 
+      // 2️⃣ Extract & normalize unique apps
+      const apps = extractUniqueApps(
+        result.rows || [],
+        "APPLICATION_NAME"
+      );
 
-// --------------------
+      return res.json(apps);
+    });
+  }
+);
+
+router.get(
+  "/applications/tl",
+  authMiddleware(["admin"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (conn) => {
+      // 1️⃣ Fetch applications assigned to this employee
+      const result = await conn.execute(
+        `
+        SELECT application_name
+        FROM employees
+        WHERE id = :employeeId
+        `,
+        { employeeId: req.user.id },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      // 2️⃣ Extract & normalize unique apps
+      const apps = extractUniqueApps(
+        result.rows || [],
+        "APPLICATION_NAME"
+      );
+
+      return res.json(apps);
+    });
+  }
+);
+
 // Hierarchy endpoint (for selects)
-// --------------------
 router.get("/hierarchy", authMiddleware(), async (req, res) => {
   return safeRoute(req, res, async (conn) => {
     const { level, ltId, altId, managerId } = req.query;

@@ -21,7 +21,7 @@ const authMiddleware = require("../middleware/auth.js");
 
 // ✅ Enhanced CRUD routes with automation
 router.post("/", authMiddleware(["manager", "admin"]), projectController.createProject);
-router.get("/", authMiddleware(["manager", "admin", "employee"]), projectController.getProjects);
+router.get("/", authMiddleware(["head_lt","lt","alt","manager", "admin", "employee"]), projectController.getProjects);
 router.get("/names", authMiddleware(["manager", "admin", "employee"]), projectController.getProjectNames);
 router.get("/:id", authMiddleware(["manager", "admin", "employee"]), projectController.getProjectById);
 router.put("/:id", authMiddleware(["manager", "admin"]), projectController.updateProject);

@@ -9,7 +9,7 @@ router.put("/:id", authMiddleware(["manager", "admin"]), moduleController.update
 router.delete("/:id", authMiddleware(["manager", "admin"]), moduleController.deleteModule);
 
 // Any logged-in user can view modules
-router.get("/", authMiddleware(["manager", "admin", "employee"]), moduleController.getModules);
+router.get("/", authMiddleware(["head_lt","lt","alt","manager", "admin", "employee"]), moduleController.getModules);
 router.get("/:id", authMiddleware(["manager", "admin", "employee"]), moduleController.getModuleById);
 
 module.exports = router;

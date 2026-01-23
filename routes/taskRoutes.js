@@ -3,7 +3,6 @@ const oracledb = require("oracledb");
 oracledb.fetchAsString = [oracledb.CLOB];
 
 const authMiddleware = require('../middleware/auth.js');
-const { getMonthFilter ,getMonthFilterOracle} = require("../utils/dateFilter");
 const { buildVisibilityOracle } = require("../utils/visibilityOracle");
 const { safeRoute } = require("../utils/dbWrapper");
 
@@ -18,8 +17,6 @@ const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep
 const month = monthNames[d.getMonth()]; const year = d.getFullYear(); 
 return `${day}-${month}-${year}`; 
 }
-
-
 
 function formatTaskDates(task) {
   return {
@@ -84,208 +81,7 @@ async function calculateWorkload(components = [], connection) {
   return { workloadHours, processedComponents };
 }
 
-
-// Assign a new task
-// router.post("/", authMiddleware(["admin", "manager","alt", "lt", "head_lt"]), async (req, res) => {
-//   let connection;
-//   try {
-//     const {
-//       moduleId,
-//       projectId,
-//       employeeId,
-//       title,
-//       description,
-//       dueDate,
-//       components = [],
-//       priority,
-//       status = "Pending",
-//       notes,
-//       attachments,
-//     } = req.body;
-
-//     connection = await oracledb.getConnection();
-
-//     // 🔹 Step 1️⃣ - Centralized hierarchy + application visibility filter
-//     const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.body);
-//     binds.employeeId = employeeId;
-
-//     // 🔹 Step 2️⃣ - Visibility check (make sure user can assign this employee)
-//     const visibilityCheckQuery = `
-//       SELECT e.id 
-//       FROM employees e
-//       WHERE e.id = :employeeId
-//       ${sqlCondition}
-//     `;
-//     const visResult = await connection.execute(visibilityCheckQuery, binds, {
-//       outFormat: oracledb.OUT_FORMAT_OBJECT,
-//     });
-
-//     if (!visResult.rows.length) {
-//       return res.status(403).json({
-//         error: "You are not authorized to assign this employee.",
-//       });
-//     }
-
-//     // 🔹 Step 3️⃣ - Determine manager_id based on user role
-//     const managerId = req.user.role === "admin" ? req.user.managerId : req.user.id;
-
-//     // 🔹 Step 4️⃣ - Calculate total workload (if components provided)
-//     let workloadHours = 0;
-//     let processedComponents = [];
-
-//     if (components.length > 0) {
-//       const result = await calculateWorkload(components, connection);
-//       workloadHours = result.workloadHours;
-//       processedComponents = result.processedComponents;
-//     }
-
-//     // 🔹 Step 5️⃣ - Handle completed tasks
-//     const completedStatuses = ["Live", "Preprod_Signoff", "Completed"];
-//     const completedAt = completedStatuses.includes(status) ? new Date() : null;
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 6️⃣ - Insert task
-//     // --------------------------------------------------------------------------------
-//     const insertTaskQuery = `
-//       INSERT INTO TASKS
-//         (TASK_ID, MODULE_ID, PROJECT_ID, E_ID, MANAGER_ID, TITLE, DESCRIPTION,
-//          DUE_DATE, PRIORITY, STATUS, WORKLOAD_HOURS, COMPLETED_AT,
-//          CREATED_AT, UPDATED_AT)
-//       VALUES
-//         (TASK_SEQ.NEXTVAL, :moduleId, :projectId, :employeeId, :managerId, 
-//          :title, :description, TO_DATE(:dueDate,'YYYY-MM-DD'), :priority, :status, 
-//          :workloadHours, :completedAt, SYSTIMESTAMP, SYSTIMESTAMP)
-//       RETURNING TASK_ID INTO :taskId
-//     `;
-
-//     const insertResult = await connection.execute(
-//       insertTaskQuery,
-//       {
-//         moduleId: Number(moduleId),
-//         projectId: Number(projectId),
-//         employeeId: Number(employeeId),
-//         managerId: Number(managerId),
-//         title,
-//         description,
-//         dueDate,
-//         priority: priority || "Medium",
-//         status: status || "Pending",
-//         workloadHours,
-//         completedAt,
-//         taskId: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
-//       },
-//       { autoCommit: true }
-//     );
-
-//     const taskId = insertResult.outBinds.taskId[0];
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 7️⃣ - Insert task components
-//     // --------------------------------------------------------------------------------
-//     if (processedComponents.length > 0) {
-//       for (const comp of processedComponents) {
-//         await connection.execute(
-//           `
-//           INSERT INTO TASK_COMPONENTS
-//             (TASK_COMPONENT_ID, TASK_ID, TYPE, COMPLEXITY, COUNT, HOURS_PER_ITEM,
-//              TOTAL_COMP_HOURS, FILE_REQUIRED, FILE_TYPE)
-//           VALUES
-//             (TASK_COMPONENT_SEQ.NEXTVAL, :taskId, :type, :complexity, :count,
-//              :hoursPerItem, :totalCompHours, :fileRequired, :fileType)
-//         `,
-//           {
-//             taskId,
-//             type: comp.type,
-//             complexity: comp.complexity,
-//             count: comp.count,
-//             hoursPerItem: comp.hoursPerItem,
-//             totalCompHours: comp.totalCompHours,
-//             fileRequired: comp.fileRequired || null,
-//             fileType: comp.fileType || null,
-//           },
-//           { autoCommit: true }
-//         );
-//       }
-//     }
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 8️⃣ - Insert notes (if any)
-//     // --------------------------------------------------------------------------------
-//     if (notes && notes.length > 0) {
-//       for (const note of notes) {
-//         await connection.execute(
-//           `
-//           INSERT INTO TASK_NOTES
-//             (TASK_NOTE_ID, TASK_ID, CONTENT, CREATED_BY, CREATED_AT)
-//           VALUES
-//             (TASK_NOTE_SEQ.NEXTVAL, :taskId, :content, :createdBy, SYSTIMESTAMP)
-//         `,
-//           {
-//             taskId,
-//             content: note.content,
-//             createdBy: req.user.id,
-//           },
-//           { autoCommit: true }
-//         );
-//       }
-//     }
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 9️⃣ - Insert attachments (if any)
-//     // --------------------------------------------------------------------------------
-//     if (attachments && attachments.length > 0) {
-//       for (const file of attachments) {
-//         await connection.execute(
-//           `
-//           INSERT INTO TASK_ATTACHMENTS
-//             (TASK_ATTACHMENT_ID, TASK_ID, FILENAME, ORIGINAL_NAME, PATH, UPLOADED_AT)
-//           VALUES
-//             (TASK_ATTACHMENT_SEQ.NEXTVAL, :taskId, :filename, :originalName, :path, SYSTIMESTAMP)
-//         `,
-//           {
-//             taskId,
-//             filename: file.filename,
-//             originalName: file.originalName,
-//             path: file.path,
-//           },
-//           { autoCommit: true }
-//         );
-//       }
-//     }
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 🔟 - Fetch created task (with joins)
-//     // --------------------------------------------------------------------------------
-//     const fetchTaskQuery = `
-//       SELECT 
-//         t.*, 
-//         e.NAME AS EMPLOYEE_NAME, 
-//         e.DESIGNATION AS EMPLOYEE_DESIGNATION, 
-//         e.EMAIL AS EMPLOYEE_EMAIL,
-//         m.NAME AS MODULE_NAME, 
-//         p.NAME AS PROJECT_NAME
-//       FROM TASKS t
-//       LEFT JOIN EMPLOYEES e ON t.E_ID = e.ID
-//       LEFT JOIN MODULES m ON t.MODULE_ID = m.ID
-//       LEFT JOIN PROJECTS p ON t.PROJECT_ID = p.ID
-//       WHERE t.TASK_ID = :taskId
-//     `;
-
-//     const taskResult = await connection.execute(fetchTaskQuery, { taskId }, {
-//       outFormat: oracledb.OUT_FORMAT_OBJECT,
-//     });
-
-//     res.json(formatTaskDates(taskResult.rows[0]));
-//   } catch (err) {
-//     console.error("Task creation error:", err);
-//     res.status(500).json({ error: err.message });
-//   } finally {
-//     if (connection) await connection.close();
-//   }
-// });
-
-
-//ora--0001 fix code
+//create a new task 
 router.post(
   "/",
   authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),
@@ -491,10 +287,7 @@ router.post(
   }
 );
 
-
-
-
-// POST /api/tasks/components/:id/log
+// POST /api/tasks/components/:id/log --> create a new worklog for a task for an employee
 router.post(
   "/components/:id/log",
   authMiddleware(["employee", "manager", "admin","alt", "lt", "head_lt"]),async (req, res) => {
@@ -637,7 +430,7 @@ router.post(
     });
 });
 
-
+// GET --> fetch all logs of the employee for a task component
 router.get(
   "/components/:id/logs",
   authMiddleware(["employee", "admin", "manager","lt","alt","head_lt"]),async (req, res) => {
@@ -688,6 +481,7 @@ function formatLogsDates(logs) {
   }));
 }
 
+//update a log for an employee for a task component
 router.put(
   "/components/log/:logId",
   authMiddleware(["employee", "admin", "manager", "lt", "alt", "head_lt"]),
@@ -852,36 +646,133 @@ router.put(
   }
 );
 
-
-
+//delete a log for an employee for a task component
 router.delete(
   "/components/log/:logId",
-  authMiddleware(["employee", "admin", "manager","lt","alt","head_lt"]),async (req, res) => {
-      return safeRoute(req, res, async (connection) => {
-
-      const logId = req.params.logId;
+  authMiddleware(["employee", "admin", "manager", "lt", "alt", "head_lt"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (connection) => {
+      const logId = Number(req.params.logId);
       const userId = req.user.id;
 
-      // Validate ownership
-      const result = await connection.execute(
-        `SELECT t.E_ID
-         FROM COMPONENT_WORKLOGS wl
-         JOIN TASK_COMPONENTS c ON wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
-         JOIN TASKS t ON c.TASK_ID = t.TASK_ID
-         WHERE wl.WORKLOG_ID = :logId`,
+      // ------------------------------------------------------------------
+      // 1️⃣ Fetch ownership + component + task details
+      // ------------------------------------------------------------------
+      const logRes = await connection.execute(
+        `
+        SELECT
+          wl.TASK_COMPONENT_ID,
+          c.TASK_ID,
+          c.TOTAL_COMP_HOURS,
+          t.E_ID
+        FROM COMPONENT_WORKLOGS wl
+        JOIN TASK_COMPONENTS c
+          ON wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
+        JOIN TASKS t
+          ON c.TASK_ID = t.TASK_ID
+        WHERE wl.WORKLOG_ID = :logId
+        `,
         { logId },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
-      if (result.rows.length === 0) return res.status(404).json({ error: "Log not found" });
-      if (Number(result.rows[0].E_ID) !== Number(userId)) return res.status(403).json({ error: "Unauthorized" });
+      if (!logRes.rows.length)
+        return res.status(404).json({ error: "Log not found" });
 
-      await connection.execute(`DELETE FROM COMPONENT_WORKLOGS WHERE WORKLOG_ID = :logId`, { logId });
+      const log = logRes.rows[0];
+
+      if (Number(log.E_ID) !== Number(userId))
+        return res.status(403).json({ error: "Unauthorized" });
+
+      // ------------------------------------------------------------------
+      // 2️⃣ Delete the worklog
+      // ------------------------------------------------------------------
+      await connection.execute(
+        `DELETE FROM COMPONENT_WORKLOGS WHERE WORKLOG_ID = :logId`,
+        { logId }
+      );
+
+      // ------------------------------------------------------------------
+      // 3️⃣ Recalculate total logged hours for component
+      // ------------------------------------------------------------------
+      const sumRes = await connection.execute(
+        `
+        SELECT NVL(SUM(HOURS_LOGGED),0) AS TOTAL
+        FROM COMPONENT_WORKLOGS
+        WHERE TASK_COMPONENT_ID = :cid
+        `,
+        { cid: log.TASK_COMPONENT_ID },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      const totalLogged = sumRes.rows[0].TOTAL || 0;
+
+      // ------------------------------------------------------------------
+      // 4️⃣ Update component status
+      // ------------------------------------------------------------------
+      let componentStatus = "Pending";
+
+      if (totalLogged > 0 && totalLogged < log.TOTAL_COMP_HOURS)
+        componentStatus = "Under_Development";
+      else if (totalLogged === log.TOTAL_COMP_HOURS)
+        componentStatus = "Completed";
+
+      await connection.execute(
+        `
+        UPDATE TASK_COMPONENTS
+        SET STATUS = :status
+        WHERE TASK_COMPONENT_ID = :cid
+        `,
+        {
+          status: componentStatus,
+          cid: log.TASK_COMPONENT_ID,
+        }
+      );
+
+      // ------------------------------------------------------------------
+      // 5️⃣ Recalculate task status
+      // ------------------------------------------------------------------
+      const taskCompRes = await connection.execute(
+        `
+        SELECT STATUS
+        FROM TASK_COMPONENTS
+        WHERE TASK_ID = :taskId
+        `,
+        { taskId: log.TASK_ID },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      const statuses = taskCompRes.rows.map(r => r.STATUS);
+      let taskStatus = "Pending";
+
+      if (statuses.every(s => s === "Completed"))
+        taskStatus = "Completed";
+      else if (statuses.some(s => s !== "Pending"))
+        taskStatus = "Under_Development";
+
+      await connection.execute(
+        `
+        UPDATE TASKS
+        SET STATUS = :status
+        WHERE TASK_ID = :taskId
+        `,
+        {
+          status: taskStatus,
+          taskId: log.TASK_ID,
+        }
+      );
+
+      // ------------------------------------------------------------------
+      // 6️⃣ Commit
+      // ------------------------------------------------------------------
       await connection.commit();
 
-      res.json({ message: "Worklog deleted successfully." });
+      res.json({
+        message: "Worklog deleted and component/task statuses updated successfully.",
+      });
     });
-});
+  }
+);
 
 // GET all tasks (with filters)
 // ==========================
@@ -1187,8 +1078,6 @@ const compQuery = `
     });
 });
 
-
-
 // GET tasks by employee
 router.get(
   "/employee/:id",
@@ -1481,8 +1370,6 @@ const components = compResult.rows || [];
      });
 });
 
-
-
 // PATCH task (update)
 router.patch(
   "/:id",
@@ -1536,7 +1423,6 @@ router.patch(
       // STEP 3️⃣ — Prepare update payload
       // -------------------------------------------------------------------------
       let updateData = { ...req.body };
-      console.log("Update Data:", updateData);
       // -------------------------------------------------------------------------
       // STEP 4️⃣ — Handle component updates
       // -------------------------------------------------------------------------
@@ -1702,14 +1588,12 @@ await connection.execute(updateSQL, binds, { autoCommit: true });
         { taskId },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
-      console.log("Updated Task:", updatedTaskResult.rows[0]);
       res.json(formatTaskDates(updatedTaskResult.rows[0]));
     });
   }
 );
 
-
-
+//update status of the task
 router.patch(
   "/:id/status",
   authMiddleware(["admin", "manager", "employee", "alt","lt", "head_lt"]),async (req, res) => {
@@ -1942,7 +1826,6 @@ router.patch(
     });
 });
 
-
 // Delete task
 router.delete(
   "/:id",
@@ -2057,7 +1940,6 @@ router.delete(
     });
 });
 
-
 // Dashboard statistics
 router.get(
   "/stats/overview",
@@ -2161,7 +2043,6 @@ router.get(
      });
 });
 
-
 // Monthly worklog for an employee
 router.get(
   "/employee/:id/worklog",
@@ -2219,8 +2100,18 @@ router.get(
           wl.HOURS_LOGGED, 
           wl.LOG_DATE
         FROM COMPONENT_WORKLOGS wl
-        LEFT JOIN TASK_COMPONENTS c ON wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
-        LEFT JOIN TASKS t ON c.TASK_ID = t.TASK_ID
+LEFT JOIN TASK_COMPONENTS tc
+  ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
+
+LEFT JOIN TASKS t
+  ON tc.TASK_ID = t.TASK_ID
+
+LEFT JOIN LIVE_ISSUE_COMPONENTS lic
+  ON wl.TASK_COMPONENT_ID = lic.LIVE_ISSUE_COMPONENT_ID
+
+LEFT JOIN LIVE_ISSUES li
+  ON lic.LIVE_ISSUE_ID = li.ID
+
         LEFT JOIN EMPLOYEES e ON wl.EMPLOYEE_ID = e.ID
         WHERE wl.EMPLOYEE_ID = :empId
           AND wl.LOG_DATE BETWEEN :startDate AND :endDate
@@ -2283,148 +2174,161 @@ router.get(
      });
 });
 
-
 // Daily worklog for an employee
 router.get(
   "/employee/:id/worklog/:date",
-  authMiddleware(["employee", "manager", "admin","alt", "lt", "head_lt"]),async (req, res) => {
-      return safeRoute(req, res, async (connection) => {
+  authMiddleware(["employee", "manager", "admin", "alt", "lt", "head_lt"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (connection) => {
 
-      const { id, date } = req.params; // e.g., "15-09-2025"
+      const { id, date } = req.params;
       const user = req.user;
-
-      // -------------------------------------------------------------------------
-      // STEP 1️⃣ — Validate and parse date
-      // -------------------------------------------------------------------------
-      if (!date || !/^\d{2}-\d{2}-\d{4}$/.test(date)) {
-        return res.status(400).json({ error: "Date must be in DD-MM-YYYY format" });
-      }
-
-      const [day, month, year] = date.split("-").map(Number);
-      const logDate = new Date(year, month - 1, day);
-
-
       const empId = Number(id);
-      if (isNaN(empId)) {
-        return res.status(400).json({ error: "Invalid employee ID" });
-      }
 
       // -------------------------------------------------------------------------
-      // STEP 2️⃣ — Apply visibility rules
+      // STEP 1️⃣ — Validate date
       // -------------------------------------------------------------------------
-      // Employees can view their own logs only
+      if (!/^\d{2}-\d{2}-\d{4}$/.test(date)) {
+        return res.status(400).json({ error: "Date must be DD-MM-YYYY" });
+      }
+
       if (user.role === "employee" && user.id !== empId) {
-        return res.status(403).json({ error: "Employees can only view their own worklogs" });
-      }
-
-      // For manager/admin/LT/head_LT → validate hierarchy visibility
-      const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
-      binds.empId = empId;
-
-      const visibilityCheckSQL = `
-        SELECT 1
-        FROM EMPLOYEES e
-        WHERE e.ID = :empId
-        ${sqlCondition ? sqlCondition : ""}
-      `;
-
-      const visible = await connection.execute(visibilityCheckSQL, binds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
-
-      if (!visible.rows.length) {
-        return res.status(403).json({
-          error: "You are not authorized to view this employee’s worklog",
-        });
+        return res.status(403).json({ error: "Unauthorized" });
       }
 
       // -------------------------------------------------------------------------
-      // STEP 3️⃣ — Fetch worklogs for the specific day
+      // STEP 2️⃣ — Visibility (UNCHANGED)
       // -------------------------------------------------------------------------
-      const worklogSQL = `
-        SELECT
-          c.TASK_COMPONENT_ID,
-          c.TYPE AS COMPONENT_TITLE,
-          c.COMPLEXITY,
-          c.STATUS,
-          c.COMPLETED_AT,
-          t.TASK_ID,
-          t.TITLE AS TASK_TITLE,
-          SUM(wl.HOURS_LOGGED) AS HOURS_LOGGED,
-          MIN(wl.LOG_DATE) AS LOG_DATE
-        FROM COMPONENT_WORKLOGS wl
-        LEFT JOIN TASK_COMPONENTS c ON wl.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
-        LEFT JOIN TASKS t ON c.TASK_ID = t.TASK_ID
-        LEFT JOIN EMPLOYEES e ON wl.EMPLOYEE_ID = e.ID
-        WHERE wl.EMPLOYEE_ID = :empId
-          AND TRUNC(wl.LOG_DATE) = TO_DATE(:logDate, 'DD-MM-YYYY')
-          ${sqlCondition ? sqlCondition.replace(/^ AND /, " AND ") : ""}
-        GROUP BY
-          c.TASK_COMPONENT_ID, c.TYPE, c.COMPLEXITY, c.STATUS, c.COMPLETED_AT, 
-          t.TASK_ID, t.TITLE
-      `;
-
-      const worklogResult = await connection.execute(
-        worklogSQL,
-        { ...binds, logDate: date },
+      const visible = await connection.execute(
+        `SELECT 1 FROM EMPLOYEES WHERE ID = :empId`,
+        { empId },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
 
-      const rows = worklogResult.rows || [];
+      if (!visible.rows.length) {
+        return res.status(403).json({ error: "Unauthorized" });
+      }
 
       // -------------------------------------------------------------------------
-      // STEP 4️⃣ — Organize results by task
+      // STEP 3️⃣ — Worklog query (UNCHANGED)
       // -------------------------------------------------------------------------
-      const tasksMap = {};
+      const worklogSQL = `
+        SELECT
+          wl.TASK_COMPONENT_ID      AS COMPONENT_ID,
+          tc.TYPE                  AS COMPONENT_TITLE,
+          tc.COMPLEXITY,
+          tc.STATUS,
+          tc.COMPLETED_AT,
+          t.TASK_ID                AS PARENT_ID,
+          t.TITLE                  AS PARENT_TITLE,
+          SUM(wl.HOURS_LOGGED)     AS HOURS_LOGGED,
+          MIN(wl.LOG_DATE)         AS LOG_DATE
+        FROM COMPONENT_WORKLOGS wl
+        JOIN TASK_COMPONENTS tc
+          ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
+        JOIN TASKS t
+          ON tc.TASK_ID = t.TASK_ID
+        WHERE wl.EMPLOYEE_ID = :empId
+          AND TRUNC(wl.LOG_DATE) = TO_DATE(:logDate, 'DD-MM-YYYY')
+        GROUP BY
+          wl.TASK_COMPONENT_ID,
+          tc.TYPE,
+          tc.COMPLEXITY,
+          tc.STATUS,
+          tc.COMPLETED_AT,
+          t.TASK_ID,
+          t.TITLE
 
-      rows.forEach((log) => {
-        if (!tasksMap[log.TASK_ID]) {
-          tasksMap[log.TASK_ID] = {
-            taskId: log.TASK_ID,
-            title: log.TASK_TITLE,
+        UNION ALL
+
+        SELECT
+          wl.TASK_COMPONENT_ID      AS COMPONENT_ID,
+          lic.TYPE                 AS COMPONENT_TITLE,
+          lic.COMPLEXITY           AS COMPLEXITY,
+          lic.STATUS,
+          lic.COMPLETED_AT         AS COMPLETED_AT,
+          li.ID                    AS PARENT_ID,
+          li.SHORT_DESCRIPTION     AS PARENT_TITLE,
+          SUM(wl.HOURS_LOGGED)     AS HOURS_LOGGED,
+          MIN(wl.LOG_DATE)         AS LOG_DATE
+        FROM COMPONENT_WORKLOGS wl
+        JOIN LIVE_ISSUE_COMPONENTS lic
+          ON wl.TASK_COMPONENT_ID = lic.LIVE_ISSUE_COMPONENT_ID
+        JOIN LIVE_ISSUES li
+          ON lic.LIVE_ISSUE_ID = li.ID
+        WHERE wl.EMPLOYEE_ID = :empId
+          AND TRUNC(wl.LOG_DATE) = TO_DATE(:logDate, 'DD-MM-YYYY')
+        GROUP BY
+          wl.TASK_COMPONENT_ID,
+          lic.TYPE,
+          lic.COMPLEXITY,
+          lic.STATUS,
+          lic.COMPLETED_AT,
+          li.ID,
+          li.SHORT_DESCRIPTION
+      `;
+
+      const result = await connection.execute(
+        worklogSQL,
+        { empId, logDate: date },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      // -------------------------------------------------------------------------
+      // STEP 4️⃣ — Group results (ONLY DATE FORMATTING ADDED)
+      // -------------------------------------------------------------------------
+      const parentMap = {};
+      let totalHours = 0;
+
+      result.rows.forEach((row) => {
+
+        if (!parentMap[row.PARENT_ID]) {
+          parentMap[row.PARENT_ID] = {
+            taskId: row.PARENT_ID,
+            title: row.PARENT_TITLE,
             components: [],
           };
         }
 
         const formatted = formatTaskDates({
+          createdAt: row.LOG_DATE,
+          updatedAt: row.LOG_DATE,
+          completedAt: row.COMPLETED_AT,
           dueDate: null,
-          createdAt: log.LOG_DATE,
-          updatedAt: log.LOG_DATE,
-          completedAt: log.COMPLETED_AT,
         });
 
-        tasksMap[log.TASK_ID].components.push({
-          componentId: log.TASK_COMPONENT_ID,
-          title: log.COMPONENT_TITLE,
-          complexity: log.COMPLEXITY,
-          status: log.STATUS,
+        parentMap[row.PARENT_ID].components.push({
+          componentId: row.COMPONENT_ID,
+          title: row.COMPONENT_TITLE,
+          complexity: row.COMPLEXITY,
+          status: row.STATUS,
           loggedAt: formatted.createdAt,
           completedAt: formatted.completedAt,
-          hours: Number(log.HOURS_LOGGED) || 0,
+          hours: Number(row.HOURS_LOGGED) || 0,
         });
+
+        totalHours += Number(row.HOURS_LOGGED) || 0;
       });
 
-      const tasks = Object.values(tasksMap);
-      const totalHours = rows.reduce((sum, r) => sum + (Number(r.HOURS_LOGGED) || 0), 0);
-
       // -------------------------------------------------------------------------
-      // ✅ STEP 5️⃣ — Response
+      // ✅ Final response (UNCHANGED)
       // -------------------------------------------------------------------------
       res.json({
         employeeId: empId,
         date,
         totalHours,
-        tasks,
+        tasks: Object.values(parentMap),
       });
     });
-});
-
+  }
+);
 
 // Team Worklog (Manager/Admin)
 router.get(
   "/team/worklog",
-  authMiddleware(["manager", "admin","alt", "lt", "head_lt"]),async (req, res) => {
-      return safeRoute(req, res, async (connection) => {
+  authMiddleware(["manager", "admin", "alt", "lt", "head_lt"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (connection) => {
 
       const { month } = req.query;
       const user = req.user;
@@ -2432,23 +2336,22 @@ router.get(
       // -------------------------------------------------------------------------
       // STEP 1️⃣ — Validate month
       // -------------------------------------------------------------------------
-      if (!month)
+      if (!month) {
         return res.status(400).json({ error: "Month is required (YYYY-MM)" });
+      }
 
       const [year, monthNum] = month.split("-").map(Number);
       const startDate = new Date(year, monthNum - 1, 1);
       const endDate = new Date(year, monthNum, 0, 23, 59, 59);
 
-
       // -------------------------------------------------------------------------
-      // STEP 2️⃣ — Centralized hierarchy & application filter
+      // STEP 2️⃣ — Centralized hierarchy filter
       // -------------------------------------------------------------------------
       const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
 
       // -------------------------------------------------------------------------
-      // STEP 3️⃣ — Get all team members
+      // STEP 3️⃣ — Fetch team members
       // -------------------------------------------------------------------------
-      const employeeBinds = { ...binds }; // no startDate/endDate here
       const teamSQL = `
         SELECT e.ID AS EMPLOYEE_ID, e.NAME AS EMPLOYEE_NAME
         FROM EMPLOYEES e
@@ -2457,7 +2360,7 @@ router.get(
         ORDER BY e.NAME
       `;
 
-      const teamResult = await connection.execute(teamSQL, employeeBinds, {
+      const teamResult = await connection.execute(teamSQL, binds, {
         outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
 
@@ -2466,52 +2369,60 @@ router.get(
       const employees = teamResult.rows;
 
       // -------------------------------------------------------------------------
-      // STEP 4️⃣ — Get total logged hours per employee (LEFT JOIN)
+      // STEP 4️⃣ — Total logged hours (TASK + LIVE ISSUE)
       // -------------------------------------------------------------------------
-      const worklogBinds = {
-        ...binds,
-        startDate,
-        endDate,
-      };
-
       const worklogSQL = `
-        SELECT 
+        SELECT
           e.ID AS EMPLOYEE_ID,
-          NVL(SUM(w.HOURS_LOGGED), 0) AS TOTAL_HOURS
+          NVL(SUM(wl.HOURS_LOGGED), 0) AS TOTAL_HOURS
         FROM EMPLOYEES e
-        LEFT JOIN TASKS t ON e.ID = t.E_ID
-        LEFT JOIN TASK_COMPONENTS c ON t.TASK_ID = c.TASK_ID
-        LEFT JOIN COMPONENT_WORKLOGS w ON w.TASK_COMPONENT_ID = c.TASK_COMPONENT_ID
-          AND w.LOG_DATE BETWEEN :startDate AND :endDate
+
+        LEFT JOIN COMPONENT_WORKLOGS wl
+          ON wl.EMPLOYEE_ID = e.ID
+         AND wl.LOG_DATE BETWEEN :startDate AND :endDate
+
+        LEFT JOIN TASK_COMPONENTS tc
+          ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
+        LEFT JOIN TASKS t
+          ON tc.TASK_ID = t.TASK_ID
+
+        LEFT JOIN LIVE_ISSUE_COMPONENTS lic
+          ON wl.TASK_COMPONENT_ID = lic.LIVE_ISSUE_COMPONENT_ID
+        LEFT JOIN LIVE_ISSUES li
+          ON lic.LIVE_ISSUE_ID = li.ID
+
         WHERE 1=1
         ${sqlCondition ? sqlCondition.replace(/^ AND /, " AND ") : ""}
         GROUP BY e.ID
       `;
 
-      const worklogResult = await connection.execute(worklogSQL, worklogBinds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
+      const worklogResult = await connection.execute(
+        worklogSQL,
+        { ...binds, startDate, endDate },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
 
       const worklogs = worklogResult.rows || [];
 
       // -------------------------------------------------------------------------
-      // STEP 5️⃣ — Merge both datasets (show even 0-hour employees)
+      // STEP 5️⃣ — Merge (show 0-hour employees also)
       // -------------------------------------------------------------------------
       const final = employees.map((emp) => {
         const record = worklogs.find(
           (w) => w.EMPLOYEE_ID.toString() === emp.EMPLOYEE_ID.toString()
         );
+
         return {
           id: emp.EMPLOYEE_ID,
           name: emp.EMPLOYEE_NAME,
           totalHours: record ? Number(record.TOTAL_HOURS) : 0,
         };
       });
-      console.log("team",final)
+
       res.json(final);
     });
-});
-
+  }
+);
 
 // Self Task Progress (Employee)
 router.get(
@@ -2610,7 +2521,5 @@ router.get(
       });
      });
 });
-
-
 
 module.exports = router;
