@@ -46,23 +46,27 @@ router.get("/attendance", authMiddleware(["admin", "manager"]), async (req, res)
 // ------------------ TASKS PROGRESS ------------------
 router.get(
   "/tasks-progress",
-  authMiddleware(["admin", "manager", "alt","lt", "head_lt"]),
+  authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),
   async (req, res) => {
     return safeRoute(req, res, async (connection) => {
-   
       const { month, year } = req.query;
-      if (!month || !year)
+      if (!month || !year) {
         return res.status(400).json({ error: "month and year are required" });
+      }
 
       const { startDate, endDate } = getMonthFilterOracle(month, year);
 
+      // -------------------------------------------------------
+      // Visibility (hierarchy only)
+      // -------------------------------------------------------
+      const {
+        sqlCondition,
+        binds: visibilityBinds,
+      } = buildVisibilityOracle(req.user, req.query);
 
-      // 🔹 Hierarchy filter
-      const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
-      binds.startDate = startDate;
-      binds.endDate = endDate;
-
-      // 🔹 Include only: due_date OR worklog entries in that month
+      // -------------------------------------------------------
+      // MAIN QUERY
+      // -------------------------------------------------------
       const sql = `
         SELECT 
           t.e_id,
@@ -71,11 +75,25 @@ router.get(
         FROM tasks t
         JOIN employees e ON t.e_id = e.id
         WHERE (
+          -- 🟢 Pending tasks from previous months (still open)
+          (
+            t.status NOT IN ('Completed', 'Dropped', 'Live')
+            AND t.due_date <= :endDate
+          )
+
+          OR
+
+          -- 🔵 Tasks due in this month
           t.due_date BETWEEN :startDate AND :endDate
-          OR EXISTS (
+
+          OR
+
+          -- 🟣 Tasks with worklogs in this month
+          EXISTS (
             SELECT 1
             FROM component_worklogs cw
-            JOIN task_components tc ON cw.task_component_id = tc.task_component_id
+            JOIN task_components tc
+              ON cw.task_component_id = tc.task_component_id
             WHERE tc.task_id = t.task_id
               AND cw.log_date BETWEEN :startDate AND :endDate
           )
@@ -84,11 +102,19 @@ router.get(
         GROUP BY t.e_id, t.status
       `;
 
-      const result = await connection.execute(sql, binds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
+      const result = await connection.execute(
+        sql,
+        {
+          startDate,
+          endDate,
+          ...visibilityBinds,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
 
-      // 🔹 Transform results
+      // -------------------------------------------------------
+      // TRANSFORM RESULTS
+      // -------------------------------------------------------
       const statsMap = {};
       result.rows.forEach((r) => {
         const eId = r.E_ID;
@@ -99,15 +125,18 @@ router.get(
         });
       });
 
-      // 🔹 Get employee names
       const ids = Object.keys(statsMap);
       if (ids.length === 0) return res.json([]);
 
+      // -------------------------------------------------------
+      // FETCH EMPLOYEE NAMES
+      // -------------------------------------------------------
       const nameSQL = `
-        SELECT id, name 
-        FROM employees 
+        SELECT id, name
+        FROM employees
         WHERE id IN (${ids.map((_, i) => `:id${i}`).join(",")})
       `;
+
       const nameBinds = ids.reduce(
         (acc, val, idx) => ({ ...acc, [`id${idx}`]: val }),
         {}
@@ -117,7 +146,9 @@ router.get(
         outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
 
-      // 🔹 Combine & sort
+      // -------------------------------------------------------
+      // FINAL RESPONSE
+      // -------------------------------------------------------
       const final = names.rows
         .map((r) => ({
           id: r.ID,
@@ -125,10 +156,12 @@ router.get(
           statuses: statsMap[r.ID]?.statuses || [],
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
+
       res.json(final);
     });
   }
 );
+
 
 // --------------------LIVE ISSUES SUMMARY--------------------
 router.get(
@@ -138,18 +171,22 @@ router.get(
     return safeRoute(req, res, async (connection) => {
       const { month, year } = req.query;
 
-      if (!month || !year)
+      if (!month || !year) {
         return res.status(400).json({ error: "month and year are required" });
+      }
 
       const { startDate, endDate } = getMonthFilterOracle(month, year);
 
-      // 🔹 Hierarchy / visibility
-      const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
-      binds.startDate = startDate;
-      binds.endDate = endDate;
+      // -------------------------------------------------------
+      // Visibility (hierarchy only)
+      // -------------------------------------------------------
+      const {
+        sqlCondition,
+        binds: visibilityBinds,
+      } = buildVisibilityOracle(req.user, req.query);
 
       // =======================================================
-      // LIVE ISSUE PROGRESS QUERY
+      // LIVE ISSUE PROGRESS QUERY (FINAL)
       // =======================================================
       const sql = `
         SELECT
@@ -160,8 +197,21 @@ router.get(
         JOIN employees e
           ON li.assigned_employee_id = e.id
         WHERE (
+          -- 🟢 Pending live issues from previous months
+          (
+            li.status IN ('Open','WIP','Pending')
+            AND li.date_reported <= :endDate
+          )
+
+          OR
+
+          -- 🔵 Live issues due this month
           li.uat_eta_date BETWEEN :startDate AND :endDate
-          OR EXISTS (
+
+          OR
+
+          -- 🟣 Live issues worked on this month
+          EXISTS (
             SELECT 1
             FROM component_worklogs cw
             JOIN live_issue_components lic
@@ -169,17 +219,28 @@ router.get(
             WHERE lic.live_issue_id = li.id
               AND cw.log_date BETWEEN :startDate AND :endDate
           )
+
+          OR
+
+          -- 🟠 Live issues reported this month (NEW)
+          li.date_reported BETWEEN :startDate AND :endDate
         )
         ${sqlCondition}
         GROUP BY li.assigned_employee_id, li.status
       `;
 
-      const result = await connection.execute(sql, binds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
+      const result = await connection.execute(
+        sql,
+        {
+          startDate,
+          endDate,
+          ...visibilityBinds,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
 
       // =======================================================
-      // TRANSFORM RESULT (same structure as tasks)
+      // TRANSFORM RESULT
       // =======================================================
       const statsMap = {};
       result.rows.forEach((r) => {
@@ -223,251 +284,13 @@ router.get(
           statuses: statsMap[r.ID]?.statuses || [],
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
-        console.log(final)
+
       res.json(final);
     });
   }
 );
 
-// ------------------ WORKLOAD ROUTE ------------------
-// router.get("/workload", authMiddleware(["admin", "manager","alt", "lt", "head_lt"]), async (req, res) => {
-//   return safeRoute(req, res, async (connection) => {
-//     const { month, year } = req.query;
-
-//     if (!month || !year)
-//       return res.status(400).json({ error: "month and year are required" });
-
-//     // 🔹 Centralized visibility & application filter
-//     const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
-
-//     // 🔹 Date filter
-//     const startDate = new Date(year, month - 1, 1);
-//     const endDate = new Date(year, month, 0, 23, 59, 59);
-//     binds.startDate = startDate;
-//     binds.endDate = endDate;
-//     binds.today = new Date();
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 1️⃣ - Base workload query (tasks due this month OR worked this month)
-//     // --------------------------------------------------------------------------------
-//     const workloadQuery = `
-//       SELECT 
-//         t.task_id,
-//         t.e_id,
-//         t.module_id,
-//         t.project_id,
-//         NVL(t.workload_hours, 0) AS total_hours,
-//         SUM(
-//           CASE 
-//             WHEN t.status NOT IN ('Live','Dropped','Completed') 
-//                  AND t.due_date < :today 
-//             THEN NVL(t.workload_hours, 0) 
-//             ELSE 0 
-//           END
-//         ) AS overdue_hours
-//       FROM tasks t
-//       JOIN employees e ON t.e_id = e.id
-//       WHERE (
-//         t.due_date BETWEEN :startDate AND :endDate
-//         OR EXISTS (
-//           SELECT 1 
-//           FROM component_worklogs cw
-//           JOIN task_components tc 
-//             ON cw.task_component_id = tc.task_component_id
-//           WHERE tc.task_id = t.task_id
-//             AND cw.log_date BETWEEN :startDate AND :endDate
-//         )
-//       )
-//       ${sqlCondition}
-//       GROUP BY t.task_id, t.e_id, t.module_id, t.project_id, t.workload_hours
-//     `;
-
-//     const baseResult = await connection.execute(workloadQuery, binds, {
-//       outFormat: oracledb.OUT_FORMAT_OBJECT,
-//     });
-//     if (!baseResult.rows.length) return res.json([]);
-
-//     const taskIds = baseResult.rows.map(r => r.TASK_ID);
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 2️⃣ - Fetch logged hours (actual work done this month)
-//     // 🔸 FIX: Include cw.employee_id so logs are counted per-employee
-//     // --------------------------------------------------------------------------------
-//     const logQuery = `
-//       SELECT 
-//   tc.task_id,
-//   cw.employee_id,
-
-//   -- 🔵 Monthly logged hours
-//   SUM(
-//     CASE 
-//       WHEN cw.log_date BETWEEN :startDate AND :endDate
-//       THEN NVL(cw.hours_logged, 0)
-//       ELSE 0
-//     END
-//   ) AS MONTH_LOGGED_HOURS,
-
-//   -- 🟢 Lifetime logged hours
-//   SUM(NVL(cw.hours_logged, 0)) AS TOTAL_LOGGED_HOURS
-
-// FROM component_worklogs cw
-// JOIN task_components tc 
-//   ON cw.task_component_id = tc.task_component_id
-// WHERE tc.task_id IN (${taskIds.map((_, i) => `:tid${i}`).join(",")})
-// GROUP BY tc.task_id, cw.employee_id
-
-//     `;
-
-//     const logBinds = {
-//       startDate,
-//       endDate,
-//       ...taskIds.reduce((acc, id, i) => ({ ...acc, [`tid${i}`]: id }), {}),
-//     };
-
-//     const logResult = await connection.execute(logQuery, logBinds, {
-//       outFormat: oracledb.OUT_FORMAT_OBJECT,
-//     });
-
-//     // Map key = `${task_id}_${employee_id}` → logged_hours
-//     const logMap = Object.fromEntries(
-//   logResult.rows.map(r => [
-//     `${r.TASK_ID}_${r.EMPLOYEE_ID}`,
-//     {
-//       month: r.MONTH_LOGGED_HOURS || 0,
-//       total: r.TOTAL_LOGGED_HOURS || 0,
-//     }
-//   ])
-// );
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 3️⃣ - Combine base + logged data
-//     // --------------------------------------------------------------------------------
-//    const combined = baseResult.rows.map(row => {
-//   const logs = logMap[`${row.TASK_ID}_${row.E_ID}`] || { month: 0, total: 0 };
-
-//   const total = row.TOTAL_HOURS || 0;
-//   const completed = Math.min(logs.total, total);
-//   const pending = Math.max(total - completed, 0);
-
-//   return {
-//     e_id: row.E_ID,
-//     module_id: row.MODULE_ID,
-//     project_id: row.PROJECT_ID,
-
-//     total_hours: total,
-//     completed_hours: completed,          // 🟢 cumulative
-//     pending_hours: pending,
-//     overdue_hours: row.OVERDUE_HOURS || 0,
-
-//     month_logged_hours: logs.month        // 🔵 optional (for UI)
-//   };
-// });
-
-
-//     // --------------------------------------------------------------------------------
-// // STEP 4️⃣ - Aggregate per employee + module + project (sum all relevant hours)
-// // --------------------------------------------------------------------------------
-// const aggregated = Object.values(
-//   combined.reduce((acc, row) => {
-//     const key = `${row.e_id}-${row.module_id}-${row.project_id}`;
-
-//     if (!acc[key]) {
-//   acc[key] = { 
-//     ...row,
-//     task_count: 1,
-//     month_logged_hours: row.month_logged_hours || 0
-//   };
-// } else {
-//   acc[key].task_count++;
-//   acc[key].total_hours += row.total_hours || 0;
-//   acc[key].completed_hours += row.completed_hours || 0;
-//   acc[key].pending_hours += row.pending_hours || 0;
-//   acc[key].overdue_hours += row.overdue_hours || 0;
-//   acc[key].month_logged_hours += row.month_logged_hours || 0; // ✅ ADD
-// }
-
-
-//     return acc;
-//   }, {})
-// );
-
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 5️⃣ - Fetch details for employees, modules, and projects
-//     // --------------------------------------------------------------------------------
-//     const uniqueEmployeeIds = [...new Set(aggregated.map(r => r.e_id))];
-//     const uniqueModuleIds = [...new Set(aggregated.map(r => r.module_id).filter(Boolean))];
-//     const uniqueProjectIds = [...new Set(aggregated.map(r => r.project_id).filter(Boolean))];
-
-//     const employees =
-//       uniqueEmployeeIds.length > 0
-//         ? await connection.execute(
-//             `SELECT id, name, skills FROM employees 
-//              WHERE id IN (${uniqueEmployeeIds.map((_, i) => `:id${i}`).join(",")})`,
-//             uniqueEmployeeIds.reduce((acc, val, idx) => ({ ...acc, [`id${idx}`]: val }), {}),
-//             { outFormat: oracledb.OUT_FORMAT_OBJECT }
-//           )
-//         : { rows: [] };
-
-//     const modules =
-//       uniqueModuleIds.length > 0
-//         ? await connection.execute(
-//             `SELECT id, name AS module_name FROM modules 
-//              WHERE id IN (${uniqueModuleIds.map((_, i) => `:id${i}`).join(",")})`,
-//             uniqueModuleIds.reduce((acc, val, idx) => ({ ...acc, [`id${idx}`]: val }), {}),
-//             { outFormat: oracledb.OUT_FORMAT_OBJECT }
-//           )
-//         : { rows: [] };
-
-//     const projects =
-//       uniqueProjectIds.length > 0
-//         ? await connection.execute(
-//             `SELECT id, name AS project_name FROM projects 
-//              WHERE id IN (${uniqueProjectIds.map((_, i) => `:id${i}`).join(",")})`,
-//             uniqueProjectIds.reduce((acc, val, idx) => ({ ...acc, [`id${idx}`]: val }), {}),
-//             { outFormat: oracledb.OUT_FORMAT_OBJECT }
-//           )
-//         : { rows: [] };
-
-//     // --------------------------------------------------------------------------------
-//     // STEP 6️⃣ - Merge into enriched final response
-//     // --------------------------------------------------------------------------------
-//     const enrichedWorkloads = aggregated.map(row => {
-//       const employee = employees.rows.find(e => e.ID === row.e_id) || {};
-//       const module = modules.rows.find(m => m.ID === row.module_id) || {};
-//       const project = projects.rows.find(p => p.ID === row.project_id) || {};
-
-//       const total = row.total_hours || 0;
-//       const pct = val => (total > 0 ? Math.round((val / total) * 100) : 0);
-
-//       return {
-//         employeeId: row.e_id,
-//         employeeName: employee.NAME || "Unknown Employee",
-//         skills: employee.SKILLS ? employee.SKILLS.split(",") : [],
-//         moduleName: module.MODULE_NAME || "N/A",
-//         projectName: project.PROJECT_NAME || "N/A",
-//         taskCount: row.task_count,
-//         summary: {
-//           totalHours: total,
-//           completedHours: row.completed_hours,
-//           pendingHours: row.pending_hours,
-//           overdueHours: row.overdue_hours,
-//           monthLoggedHours: row.month_logged_hours || 0,
-//           percentages: {
-//             completed: pct(row.completed_hours),
-//             pending: pct(row.pending_hours),
-//             overdue: pct(row.overdue_hours),
-//           },
-//         },
-//       };
-//     });
-//     console.log(enrichedWorkloads)
-//     res.json(enrichedWorkloads);
-//   });
-
-// });
-
-
+// ------------------ WORKLOAD SUMMARY ROUTE ------------------
 router.get(
   "/workload",
   authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),
@@ -475,23 +298,24 @@ router.get(
     return safeRoute(req, res, async (connection) => {
       const { month, year } = req.query;
 
-      if (!month || !year)
+      if (!month || !year) {
         return res.status(400).json({ error: "month and year are required" });
+      }
 
       // -------------------------------------------------------
-      // Visibility
+      // Visibility (ROLE / HIERARCHY ONLY)
       // -------------------------------------------------------
-      const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
+      const {
+        sqlCondition,
+        binds: visibilityBinds,
+      } = buildVisibilityOracle(req.user, req.query);
 
       const startDate = new Date(year, month - 1, 1);
       const endDate = new Date(year, month, 0, 23, 59, 59);
-
-      binds.startDate = startDate;
-      binds.endDate = endDate;
-      binds.today = new Date();
+      const today = new Date();
 
       // =======================================================
-      // 1️⃣ TASK BASE QUERY
+      // 1️⃣ TASK BASE QUERY (OVERALL VISIBILITY)
       // =======================================================
       const taskBaseSQL = `
         SELECT 
@@ -503,34 +327,34 @@ router.get(
           SUM(
             CASE 
               WHEN t.status NOT IN ('Live','Dropped','Completed')
-                   AND t.due_date < :today
+                   AND TRUNC(t.due_date) < TRUNC(:today)
               THEN NVL(t.workload_hours, 0)
               ELSE 0
             END
           ) AS overdue_hours
         FROM tasks t
         JOIN employees e ON t.e_id = e.id
-        WHERE (
-          t.due_date BETWEEN :startDate AND :endDate
-          OR EXISTS (
-            SELECT 1
-            FROM component_worklogs cw
-            JOIN task_components tc
-              ON cw.task_component_id = tc.task_component_id
-            WHERE tc.task_id = t.task_id
-              AND cw.log_date BETWEEN :startDate AND :endDate
-          )
-        )
+        WHERE 1 = 1
         ${sqlCondition}
-        GROUP BY t.task_id, t.e_id, t.module_id, t.project_id, t.workload_hours
+        GROUP BY
+          t.task_id,
+          t.e_id,
+          t.module_id,
+          t.project_id,
+          t.workload_hours
       `;
 
-      const taskBase = await connection.execute(taskBaseSQL, binds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
+      const taskBase = await connection.execute(
+        taskBaseSQL,
+        {
+          today,
+          ...visibilityBinds,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
 
       // =======================================================
-      // 2️⃣ TASK LOGS
+      // 2️⃣ TASK LOGS (MONTHLY + LIFETIME)
       // =======================================================
       const taskIds = taskBase.rows.map(r => r.TASK_ID);
       let taskLogMap = {};
@@ -574,57 +398,49 @@ router.get(
       }
 
       // =======================================================
-// 3️⃣ LIVE ISSUE BASE QUERY (CORRECTED)
-// =======================================================
-const issueBaseSQL = `
-  SELECT
-  li.id AS live_issue_id,
-  li.assigned_employee_id AS e_id,
+      // 3️⃣ LIVE ISSUE BASE QUERY (OVERALL VISIBILITY)
+      // =======================================================
+      const issueBaseSQL = `
+        SELECT
+          li.id AS live_issue_id,
+          li.assigned_employee_id AS e_id,
+          NVL(li.workload_hours, 0) AS total_hours,
+          SUM(
+            CASE
+              WHEN li.status IN ('Open','Live')
+                   AND li.uat_eta_date < :today
+              THEN NVL(cw.hours_logged, 0)
+              ELSE 0
+            END
+          ) AS overdue_hours
+        FROM live_issues li
+        JOIN employees e
+          ON li.assigned_employee_id = e.id
+        LEFT JOIN live_issue_components lic
+          ON lic.live_issue_id = li.id
+        LEFT JOIN component_worklogs cw
+          ON cw.task_component_id = lic.live_issue_component_id
+        WHERE 1 = 1
+        ${sqlCondition}
+        GROUP BY
+          li.id,
+          li.assigned_employee_id,
+          li.workload_hours,
+          li.status,
+          li.uat_eta_date
+      `;
 
-  -- 🟢 Planned workload (FIX)
-  NVL(li.workload_hours, 0) AS total_hours,
-
-  -- 🔴 Overdue = logged hours if overdue
-  SUM(
-    CASE
-      WHEN li.status IN ('Open', 'Live')
-           AND li.uat_eta_date < :today
-      THEN NVL(cw.hours_logged, 0)
-      ELSE 0
-    END
-  ) AS overdue_hours
-
-FROM live_issues li
-JOIN employees e
-  ON li.assigned_employee_id = e.id
-LEFT JOIN live_issue_components lic
-  ON lic.live_issue_id = li.id
-LEFT JOIN component_worklogs cw
-  ON cw.task_component_id = lic.live_issue_component_id
-
-WHERE (
-  li.uat_eta_date BETWEEN :startDate AND :endDate
-  OR cw.log_date BETWEEN :startDate AND :endDate
-)
-
-${sqlCondition}
-
-GROUP BY
-  li.id,
-  li.assigned_employee_id,
-  li.workload_hours,
-  li.status,
-  li.uat_eta_date
-
-`;
-
-const issueBase = await connection.execute(issueBaseSQL, binds, {
-  outFormat: oracledb.OUT_FORMAT_OBJECT,
-});
-
+      const issueBase = await connection.execute(
+        issueBaseSQL,
+        {
+          today,
+          ...visibilityBinds,
+        },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
 
       // =======================================================
-      // 4️⃣ LIVE ISSUE LOGS
+      // 4️⃣ LIVE ISSUE LOGS (MONTHLY + LIFETIME)
       // =======================================================
       const issueIds = issueBase.rows.map(r => r.LIVE_ISSUE_ID);
       let issueLogMap = {};
@@ -668,17 +484,18 @@ const issueBase = await connection.execute(issueBaseSQL, binds, {
       }
 
       // =======================================================
-      // 5️⃣ MERGE TASKS + ISSUES → TOTAL WORKLOAD
+      // 5️⃣ MERGE TASKS + ISSUES
       // =======================================================
       const workloadMap = {};
 
       const absorb = (row, logs, type) => {
-        const key = `${row.E_ID}-${row.MODULE_ID}-${row.PROJECT_ID}`;
+        const key = `${row.E_ID}-${row.MODULE_ID || "NA"}-${row.PROJECT_ID || "NA"}`;
+
         if (!workloadMap[key]) {
           workloadMap[key] = {
             e_id: row.E_ID,
-            module_id: row.MODULE_ID,
-            project_id: row.PROJECT_ID,
+            module_id: row.MODULE_ID || null,
+            project_id: row.PROJECT_ID || null,
             total: 0,
             completed: 0,
             pending: 0,
@@ -719,9 +536,10 @@ const issueBase = await connection.execute(issueBaseSQL, binds, {
       const final = Object.values(workloadMap);
 
       // =======================================================
-      // 6️⃣ ENRICH
+      // 6️⃣ ENRICH EMPLOYEE DATA
       // =======================================================
       const empIds = [...new Set(final.map(r => r.e_id))];
+
       const employees = empIds.length
         ? await connection.execute(
             `SELECT id, name, skills FROM employees WHERE id IN (${empIds
@@ -737,39 +555,86 @@ const issueBase = await connection.execute(issueBaseSQL, binds, {
       );
 
       // =======================================================
-      // 7️⃣ RESPONSE
-      // =======================================================
-      res.json(
-        final.map(r => {
-          const emp = empMap[r.e_id] || {};
-          const pct = v => (r.total ? Math.round((v / r.total) * 100) : 0);
+// 6️⃣.5️⃣ ENRICH MODULE & PROJECT NAMES
+// =======================================================
+const moduleIds = [...new Set(final.map(r => r.module_id).filter(Boolean))];
+const projectIds = [...new Set(final.map(r => r.project_id).filter(Boolean))];
+// ---- Fetch modules
+const modules = moduleIds.length
+  ? await connection.execute(
+      `SELECT id, name FROM modules
+       WHERE id IN (${moduleIds.map((_, i) => `:m${i}`).join(",")})`,
+      moduleIds.reduce((a, v, i) => ({ ...a, [`m${i}`]: v }), {}),
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+    )
+  : { rows: [] };
 
-          return {
-            employeeId: r.e_id,
-            employeeName: emp.NAME || "Unknown",
-            skills: emp.SKILLS ? emp.SKILLS.split(",") : [],
-            moduleId: r.module_id,
-            projectId: r.project_id,
-            taskCount: r.task_count,
-            issueCount: r.issue_count,
-            summary: {
-              totalHours: r.total,
-              completedHours: r.completed,
-              pendingHours: r.pending,
-              overdueHours: r.overdue,
-              monthLoggedHours: r.monthLogged,
-              percentages: {
-                completed: pct(r.completed),
-                pending: pct(r.pending),
-                overdue: pct(r.overdue),
-              },
-            },
-          };
-        })
-      );
+const moduleMap = Object.fromEntries(
+  modules.rows.map(m => [m.ID, m.NAME])
+);
+
+// ---- Fetch projects
+const projects = projectIds.length
+  ? await connection.execute(
+      `SELECT id, name FROM projects
+       WHERE id IN (${projectIds.map((_, i) => `:p${i}`).join(",")})`,
+      projectIds.reduce((a, v, i) => ({ ...a, [`p${i}`]: v }), {}),
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+    )
+  : { rows: [] };
+
+const projectMap = Object.fromEntries(
+  projects.rows.map(p => [p.ID, p.NAME])
+);
+
+
+      // =======================================================
+      // 7️⃣ RESPONSE (SEMANTICALLY CORRECT)
+      // =======================================================
+res.json(
+  final.map(r => {
+    const emp = empMap[r.e_id] || {};
+
+    const pctTotal = v =>
+      r.total ? Math.round((v / r.total) * 100) : 0;
+
+    const pctPending = v =>
+      r.pending ? Math.round((v / r.pending) * 100) : 0;
+
+    return {
+      employeeId: r.e_id,
+      employeeName: emp.NAME || "Unknown",
+      skills: emp.SKILLS ? emp.SKILLS.split(",") : [],
+
+      moduleId: r.module_id,
+      moduleName: r.module_id ? moduleMap[r.module_id] || "Unknown" : null,
+
+      projectId: r.project_id,
+      projectName: r.project_id ? projectMap[r.project_id] || "Unknown" : null,
+
+      taskCount: r.task_count,
+      issueCount: r.issue_count,
+
+      summary: {
+        totalHours: r.total,
+        completedHours: r.completed,
+        pendingHours: r.pending,
+        overdueHours: r.overdue,
+        monthLoggedHours: r.monthLogged,
+        percentages: {
+          completed: pctTotal(r.completed),
+          pending: pctTotal(r.pending),
+          overdue: pctPending(r.overdue),
+        },
+      },
+    };
+  })
+);
+
     });
   }
 );
+
 
 
 // ------------------ MODULE SUMMARY ROUTE ------------------
@@ -864,24 +729,58 @@ router.get(
   authMiddleware(["admin", "manager", "alt", "lt", "head_lt"]),
   async (req, res) => {
     return safeRoute(req, res, async (connection) => {
-      const { tlId } = req.query;
 
-      // 🔹 Centralized visibility & app filter
-      const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
+      const user = req.user;
+      const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
+      const { applicationId, tlId } = req.query;
 
-      const today = new Date();
-      binds.today = today;
+      let where = "";
+      let finalBinds = { ...binds };
 
-      // ✅ If TL filter applied, use tech_fpr_tl instead of employee visibility
-      let projectFilterSQL = sqlCondition;
-      if (tlId) {
-        projectFilterSQL += ` AND p.tech_fpr_tl = :tlId`;
-        binds.tlId = tlId;
+      /* ---------------------------------------------------------
+         1️⃣ Manager-Owned Visibility
+      --------------------------------------------------------- */
+
+      if (user.role === "admin") {
+        where = `
+          WHERE m.manager_id = (
+            SELECT manager_id
+            FROM employees
+            WHERE id = :currentUserId
+          )
+        `;
+        finalBinds = { currentUserId: user.id };
+      } else {
+        where = `
+          WHERE m.manager_id IN (
+            SELECT e.id
+            FROM employees e
+            WHERE 1=1
+            ${sqlCondition}
+          )
+        `;
       }
 
-      // --------------------------------------------------
-      // STEP 1️⃣ - Project summary (DATE-INDEPENDENT)
-      // --------------------------------------------------
+      /* ---------------------------------------------------------
+         2️⃣ Optional Filters
+      --------------------------------------------------------- */
+
+      if (tlId) {
+        where += ` AND p.tech_fpr_tl = :tlId`;
+        finalBinds.tlId = tlId;
+      }
+
+      if (applicationId && applicationId !== "all") {
+        where += ` AND m.application_id = :applicationId`;
+        finalBinds.applicationId = Number(applicationId);
+      }
+
+      finalBinds.today = new Date();
+
+      /* ---------------------------------------------------------
+         3️⃣ Project Summary Query (UPDATED)
+      --------------------------------------------------------- */
+
       const summarySQL = `
         SELECT
           p.id AS "projectId",
@@ -891,74 +790,127 @@ router.get(
           p.GO_LIVE_END_DATE AS "goLiveEndDate",
           m.name AS "moduleName",
           p.project_stage AS "projectStage",
+
+          /* ---------------- TASKS ---------------- */
           COUNT(DISTINCT t.task_id) AS "taskCount",
           COUNT(DISTINCT t.e_id) AS "employeeCount",
 
-          -- Completed
-          SUM(CASE 
-                WHEN t.status IN ('Live','Preprod_Signoff','Completed') 
-                THEN 1 ELSE 0 
-              END) AS "completedTasks",
+          SUM(
+            CASE 
+              WHEN t.status IN ('Live','Preprod_Signoff','Completed') 
+              THEN 1 ELSE 0 
+            END
+          ) AS "completedTasks",
 
-          -- In Progress
-          SUM(CASE 
-                WHEN t.status IN ('Under_Development','Under_UAT','Under_Preprod','UAT_Signoff','Under_QA','WIP') 
-                THEN 1 ELSE 0 
-              END) AS "inProgressTasks",
+          SUM(
+            CASE 
+              WHEN t.status IN (
+                'Under_Development','Under_UAT','Under_Preprod',
+                'UAT_Signoff','Under_QA','WIP'
+              )
+              THEN 1 ELSE 0 
+            END
+          ) AS "inProgressTasks",
 
-          -- Pending
-          SUM(CASE 
-                WHEN t.status IN ('BRS_Discussion','Approach_Preparation','Approach_Finalization','Pending') 
-                THEN 1 ELSE 0 
-              END) AS "pendingTasks",
+          SUM(
+            CASE 
+              WHEN t.status IN (
+                'BRS_Discussion','Approach_Preparation',
+                'Approach_Finalization','Pending'
+              )
+              THEN 1 ELSE 0 
+            END
+          ) AS "pendingTasks",
 
-          -- Overdue In Progress
-          SUM(CASE 
-                WHEN t.status IN ('Under_Development','Under_UAT','Under_Preprod','UAT_Signoff','Under_QA','WIP') 
-                     AND t.due_date < :today 
-                THEN 1 ELSE 0 
-              END) AS "overdueInProgress",
+          SUM(
+            CASE 
+              WHEN t.status IN (
+                'Under_Development','Under_UAT','Under_Preprod',
+                'UAT_Signoff','Under_QA','WIP'
+              )
+              AND t.due_date < :today
+              THEN 1 ELSE 0 
+            END
+          ) AS "overdueInProgress",
 
-          -- Overdue Pending
-          SUM(CASE 
-                WHEN t.status IN ('BRS_Discussion','Approach_Preparation','Approach_Finalization','Pending') 
-                     AND t.due_date < :today 
-                THEN 1 ELSE 0 
-              END) AS "overduePending"
+          SUM(
+            CASE 
+              WHEN t.status IN (
+                'BRS_Discussion','Approach_Preparation',
+                'Approach_Finalization','Pending'
+              )
+              AND t.due_date < :today
+              THEN 1 ELSE 0 
+            END
+          ) AS "overduePending",
+
+          /* ---------------- LIVE ISSUES ---------------- */
+          NVL(li.issueCount, 0) AS "issueCount",
+          NVL(li.completedIssues, 0) AS "completedIssues",
+          NVL(li.openIssues, 0) AS "openIssues"
 
         FROM projects p
-        LEFT JOIN modules m ON p.module_id = m.id
-        LEFT JOIN tasks t ON t.project_id = p.id
-        LEFT JOIN employees e ON t.e_id = e.id
-        WHERE t.e_id IS NOT NULL
-        ${projectFilterSQL}
-        GROUP BY p.id, p.name, m.name, p.project_stage, p.planned_end_date, p.on_track_status,p.go_live_end_date
+        JOIN modules m ON p.module_id = m.id
+
+        LEFT JOIN tasks t 
+          ON t.project_id = p.id
+
+        /* ✅ SAFE SUBQUERY FOR LIVE ISSUES */
+        LEFT JOIN (
+          SELECT 
+            project_id,
+            COUNT(*) AS issueCount,
+            SUM(CASE WHEN status = 'Completed' THEN 1 ELSE 0 END) AS completedIssues,
+            SUM(CASE WHEN status IN ('Open','WIP','Hold') THEN 1 ELSE 0 END) AS openIssues
+          FROM LIVE_ISSUES
+          GROUP BY project_id
+        ) li 
+          ON li.project_id = p.id
+
+        ${where}
+
+        GROUP BY
+          p.id,
+          p.name,
+          m.name,
+          p.project_stage,
+          p.planned_end_date,
+          p.on_track_status,
+          p.go_live_end_date,
+          li.issueCount,
+          li.completedIssues,
+          li.openIssues
+
         ORDER BY p.name
       `;
 
-      const summaryResult = await connection.execute(summarySQL, binds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
+      const summaryResult = await connection.execute(
+        summarySQL,
+        finalBinds,
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
 
       const projects = summaryResult.rows || [];
-      if (projects.length === 0) {
+
+      if (!projects.length) {
         return res.json({
           projects: [],
-          selectedApplication: req.query.applicationName || "all",
+          selectedApplication: applicationId || "all",
         });
       }
 
-      // --------------------------------------------------
-      // STEP 2️⃣ - Fetch project change logs (CLOB parsing)
-      // --------------------------------------------------
+      /* ---------------------------------------------------------
+         4️⃣ Stage Change Logs (UNCHANGED)
+      --------------------------------------------------------- */
+
       const projectIds = projects.map((p) => p.projectId);
+
       const clobSQL = `
         SELECT 
-          p.id AS "projectId",
-          p.updated_at AS "updatedAt",
-          p.change_log AS "changeLog"
-        FROM projects p
-        WHERE p.id IN (${projectIds.map((_, i) => `:id${i}`).join(",")})
+          id AS "projectId",
+          change_log AS "changeLog"
+        FROM projects
+        WHERE id IN (${projectIds.map((_, i) => `:id${i}`).join(",")})
       `;
 
       const clobBinds = projectIds.reduce(
@@ -970,69 +922,44 @@ router.get(
         outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
 
-      const changeLogs = [];
+      const stageChangesMap = {};
+
       for (const row of clobResult.rows) {
-        let existingLog = [];
+        let logs = [];
         try {
           if (row.changeLog) {
-            let logData;
-            if (row.changeLog instanceof oracledb.Lob) {
-              logData = await new Promise((resolve, reject) => {
-                let data = "";
-                row.changeLog.setEncoding("utf8");
-                row.changeLog.on("data", (chunk) => (data += chunk));
-                row.changeLog.on("end", () => resolve(data));
-                row.changeLog.on("error", (err) => reject(err));
-              });
-            } else {
-              logData = row.changeLog;
-            }
-            const parsed = JSON.parse(logData);
-            existingLog = Array.isArray(parsed) ? parsed : [parsed];
+            let data =
+              row.changeLog instanceof oracledb.Lob
+                ? await new Promise((resolve, reject) => {
+                    let d = "";
+                    row.changeLog.setEncoding("utf8");
+                    row.changeLog.on("data", (c) => (d += c));
+                    row.changeLog.on("end", () => resolve(d));
+                    row.changeLog.on("error", reject);
+                  })
+                : row.changeLog;
+
+            const parsed = JSON.parse(data);
+            logs = Array.isArray(parsed) ? parsed : [parsed];
           }
-        } catch (err) {
-          console.error(
-            `Failed to parse change_log for project ${row.projectId}:`,
-            err
-          );
-          existingLog = [];
+        } catch {
+          logs = [];
         }
 
-        changeLogs.push({
-          projectId: row.projectId,
-          updatedAt: row.updatedAt,
-          changeLog: existingLog,
-        });
-      }
-
-      // --------------------------------------------------
-      // STEP 3️⃣ - Extract project stage transitions
-      // --------------------------------------------------
-      const stageChangesMap = {};
-      changeLogs.forEach((logEntry) => {
-        const entries = logEntry.changeLog || [];
-        stageChangesMap[logEntry.projectId] = entries
-          .filter((e) => e.changes && e.changes.project_stage)
+        stageChangesMap[row.projectId] = logs
+          .filter((e) => e.changes?.project_stage)
           .map((e) => ({
             stage: e.changes.project_stage.new,
-            changedAt: formatDateForDisplay(e.timestamp),
+            changedAt: e.timestamp,
           }));
-      });
+      }
 
-      // --------------------------------------------------
-      // STEP 4️⃣ - Attach stage changes to summary
-      // --------------------------------------------------
-      const projectsWithStages = projects.map((p) => ({
-        ...p,
-        stageChanges: stageChangesMap[p.projectId] || [],
-      }));
-
-      // --------------------------------------------------
-      // STEP 5️⃣ - Final response
-      // --------------------------------------------------
       res.json({
-        projects: projectsWithStages,
-        selectedApplication: req.query.applicationName || "all",
+        projects: projects.map((p) => ({
+          ...p,
+          stageChanges: stageChangesMap[p.projectId] || [],
+        })),
+        selectedApplication: applicationId || "all",
       });
     });
   }
@@ -1060,40 +987,69 @@ router.get(
       }
 
       // --------------------------------------------------
-      // STEP 1️⃣ — Stage-wise project + modification summary
+      // STEP 1️⃣ — Stage-wise summary based on JSON stage
       // --------------------------------------------------
       const summarySQL = `
         SELECT
-          p.project_stage AS projectStage,
+          COALESCE(jt.stage, p.project_stage) AS projectStage,
 
-          COUNT(p.id) AS projectCount,
+          COUNT(DISTINCT p.id) AS projectCount,
 
-          SUM(
-            NVL(
-              (
-                SELECT COUNT(*)
-                FROM JSON_TABLE(
-                  p.project_changes_received,
-                  '$[*]' COLUMNS (dummy PATH '$')
-                )
-              ),
-              0
+          COUNT(jt.stage) AS modificationCount,
+
+          JSON_ARRAYAGG(
+            JSON_OBJECT(
+              'stage' VALUE jt.stage,
+              'date' VALUE jt.change_date,
+              'timestamp' VALUE jt.timestamp,
+              'details' VALUE jt.details,
+              'updatedBy' VALUE jt.updatedBy
             )
-          ) AS modificationCount
+            RETURNING CLOB
+          ) AS stageChanges
 
         FROM projects p
-        WHERE 1=1
-          ${projectFilterSQL}
-        GROUP BY p.project_stage
-        ORDER BY p.project_stage
-      `;
 
+        LEFT JOIN JSON_TABLE(
+          p.project_changes_received,
+          '$[*]'
+          COLUMNS (
+            stage        VARCHAR2(50)   PATH '$.stage',
+            change_date VARCHAR2(20)   PATH '$.date',
+            timestamp   VARCHAR2(50)   PATH '$.timestamp',
+            details     VARCHAR2(4000) PATH '$.details',
+            updatedBy   VARCHAR2(100)  PATH '$.updatedBy'
+          )
+        ) jt
+          ON 1 = 1
+
+        WHERE 1 = 1
+          ${projectFilterSQL}
+
+        GROUP BY
+          COALESCE(jt.stage, p.project_stage)
+
+        ORDER BY projectStage
+      `;
       const result = await connection.execute(summarySQL, binds, {
         outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
 
       // --------------------------------------------------
-      // STEP 2️⃣ — Normalize all stages
+      // STEP 2️⃣ — Safe CLOB parser
+      // --------------------------------------------------
+      const parseClobJson = async (clob) => {
+        if (!clob) return [];
+        if (typeof clob === "string") return JSON.parse(clob);
+
+        let data = "";
+        clob.setEncoding("utf8");
+        for await (const chunk of clob) data += chunk;
+        return JSON.parse(data);
+      };
+
+      // --------------------------------------------------
+      // STEP 3️⃣ — Normalize all stages
       // --------------------------------------------------
       const allStages = [
         "BRS_Discussion",
@@ -1111,14 +1067,21 @@ router.get(
 
       const stageSummary = {};
 
-      allStages.forEach((stage) => {
-        const record = result.rows.find(r => r.PROJECTSTAGE === stage);
+      for (const stage of allStages) {
+        const record = result.rows.find(
+          (r) => r.PROJECTSTAGE === stage
+        );
 
         stageSummary[stage] = {
           projectCount: record ? Number(record.PROJECTCOUNT) : 0,
           modificationCount: record ? Number(record.MODIFICATIONCOUNT) : 0,
+          stageChanges: record
+            ? (await parseClobJson(record.STAGECHANGES)).filter(
+                (c) => c.stage !== null
+              )
+            : [],
         };
-      });
+      }
 
       // --------------------------------------------------
       // ✅ FINAL RESPONSE
