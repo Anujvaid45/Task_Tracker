@@ -114,7 +114,8 @@ router.post(
 
       const {
         applicationName,
-        moduleName,
+        moduleId,
+        projectId,
         subModule,
         reportedBy,
         reportingGroup,
@@ -123,6 +124,7 @@ router.post(
         category,
         priority,
         status = "Open",
+        issueStage,
         remarks,
         assignedEmployeeId,
         uatEtaDate,
@@ -133,7 +135,6 @@ router.post(
     // ------------------------------------------------------------
 // 🔐 EMPLOYEE SELF-ASSIGNMENT BYPASS
 // ------------------------------------------------------------
-console.log("Assigned Employee ID:", assignedEmployeeId, "User ID:", req.user.id);
 if (
   req.user.role === "employee" &&
   Number(assignedEmployeeId) === Number(req.user.id)
@@ -177,7 +178,23 @@ if (
         workloadHours = r.workloadHours;
         processedComponents = r.processedComponents;
       }
+let finalApplicationName = applicationName;
+if (Number(applicationName) && applicationName !== "all") {
+  const appRes = await conn.execute(
+    `SELECT name FROM applications WHERE id = :id`,
+    { id: Number(applicationName) },
+    { outFormat: oracledb.OUT_FORMAT_OBJECT }
+  );
 
+  if (appRes.rows.length > 0) {
+    finalApplicationName = appRes.rows[0].NAME;
+  }
+}
+const moduleRes = await conn.execute(
+  `SELECT name FROM modules WHERE id = :id`,
+  { id: Number(moduleId) }
+);
+const moduleName = moduleRes.rows[0][0];
       // ------------------------------------------------------------
       // 3️⃣ INSERT LIVE ISSUE (SEQ_LIVE_ISSUE)
       // ------------------------------------------------------------
@@ -186,6 +203,7 @@ if (
           ID,
           APPLICATION_NAME,
           MODULE_NAME,
+          PROJECT_ID,
           SUB_MODULE,
           REPORTED_BY,
           REPORTING_GROUP,
@@ -194,6 +212,7 @@ if (
           CATEGORY,
           PRIORITY,
           STATUS,
+          ISSUE_STAGE,
           REMARKS,
           ASSIGNED_EMPLOYEE_ID,
           UAT_ETA_DATE,
@@ -204,8 +223,9 @@ if (
         )
         VALUES (
           SEQ_LIVE_ISSUES.NEXTVAL,
-          :applicationName,
+          :finalApplicationName,
           :moduleName,
+          :projectId,
           :subModule,
           :reportedBy,
           :reportingGroup,
@@ -214,6 +234,7 @@ if (
           :category,
           :priority,
           :status,
+          :issueStage,
           :remarks,
           :assignedEmployeeId,
           :uatEtaDate,
@@ -226,8 +247,9 @@ if (
       `;
 
       const liveIssueResult = await conn.execute(insertLiveIssueSql, {
-        applicationName,
+        finalApplicationName,
         moduleName,
+        projectId,
         subModule,
         reportedBy,
         reportingGroup,
@@ -236,6 +258,7 @@ if (
         category,
         priority: priority || "Medium",
         status,
+        issueStage,
         remarks,
         assignedEmployeeId,
         uatEtaDate: uatEtaDate ? new Date(uatEtaDate) : null,
@@ -327,13 +350,12 @@ router.get(
         status,
         priority,
         employeeId,
-        moduleName,
+        moduleId,
         applicationName,
         month,
         year,
         sortBy,
       } = req.query;
-
       // -------------------------------------------------------------------------
       // STEP 1️⃣ — Visibility filter
       // -------------------------------------------------------------------------
@@ -359,7 +381,13 @@ router.get(
         binds.employeeId = Number(employeeId);
       }
 
-      if (moduleName) {
+      
+      if (moduleId) {
+        const moduleRes = await connection.execute(
+  `SELECT name FROM modules WHERE id = :id`,
+  { id: Number(moduleId) }
+);
+const moduleName = moduleRes.rows[0][0];
         whereClauses.push("li.MODULE_NAME = :moduleName");
         binds.moduleName = moduleName;
       }
@@ -370,31 +398,50 @@ router.get(
       }
 
       // -------------------------------------------------------------------------
-      // STEP 3️⃣ — Month/year filter (reported date OR worklog activity)
-      // -------------------------------------------------------------------------
-      if (month && year) {
-        const { start, end } = getMonthDateRange(Number(month), Number(year));
-        whereClauses.push(`
-          (
-            li.CREATED_AT BETWEEN :startDate AND :endDate
-            OR li.ID IN (
-              SELECT DISTINCT lic.LIVE_ISSUE_ID
-              FROM COMPONENT_WORKLOGS wl
-              JOIN LIVE_ISSUE_COMPONENTS lic
-                ON wl.TASK_COMPONENT_ID = lic.LIVE_ISSUE_COMPONENT_ID
-              WHERE wl.LOG_DATE BETWEEN :startDate AND :endDate
-            )
-          )
-        `);
-        binds.startDate = start;
-        binds.endDate = end;
-      }
+// STEP 3️⃣ — Month/year filter (CORRECTED)
+// -------------------------------------------------------------------------
+if (month && year) {
+  const { start, end } = getMonthDateRange(Number(month), Number(year));
 
-      if (sqlCondition) whereClauses.push(sqlCondition.replace(/^ AND /, ""));
+  whereClauses.push(`
+(
+  -- 🟢 Always show pending issues (even from previous months)
+  li.STATUS IN ('Open', 'WIP', 'Pending')
 
-      const whereSQL = whereClauses.length
-        ? "WHERE " + whereClauses.join(" AND ")
-        : "";
+  OR
+
+  -- 🔵 Issues created this month
+  li.DATE_REPORTED BETWEEN :startDate AND :endDate
+
+  OR
+
+  -- 🟣 Issues with worklogs (any time) & not completed
+  (
+    li.STATUS IN ('Open', 'WIP', 'Pending')
+    AND EXISTS (
+      SELECT 1
+      FROM COMPONENT_WORKLOGS wl
+      JOIN LIVE_ISSUE_COMPONENTS lic
+        ON wl.TASK_COMPONENT_ID = lic.LIVE_ISSUE_COMPONENT_ID
+      WHERE lic.LIVE_ISSUE_ID = li.ID
+    )
+  )
+
+  OR
+
+  -- 🟠 Completed issues closed this month
+  (
+    li.STATUS = 'Completed'
+    AND li.CLOSED_AT BETWEEN :startDate AND :endDate
+  )
+)
+`);
+
+
+  binds.startDate = start;
+  binds.endDate = end;
+}
+if (sqlCondition) whereClauses.push(sqlCondition.replace(/^ AND /, "")); const whereSQL = whereClauses.length ? "WHERE " + whereClauses.join(" AND ") : "";
 
       // -------------------------------------------------------------------------
       // STEP 4️⃣ — Sorting
@@ -411,12 +458,14 @@ router.get(
       const sql = `
         SELECT
           li.*,
+          p.NAME as PROJECT_NAME,
           e.NAME AS EMPLOYEE_NAME,
           e.DESIGNATION AS EMPLOYEE_DESIGNATION,
           e.EMAIL AS EMPLOYEE_EMAIL
         FROM LIVE_ISSUES li
         LEFT JOIN EMPLOYEES e
           ON li.ASSIGNED_EMPLOYEE_ID = e.ID
+        LEFT JOIN PROJECTS p ON li.PROJECT_ID = p.ID
         ${whereSQL}
         ${orderBy}
       `;
@@ -437,6 +486,7 @@ router.get(
         dateReported:row.DATE_REPORTED,
         applicationName: row.APPLICATION_NAME,
         moduleName: row.MODULE_NAME,
+        projectName: row.PROJECT_NAME,
         subModuleName: row.SUB_MODULE,
         shortDescription: row.SHORT_DESCRIPTION,
         issueDetails: row.ISSUE_DETAILS,
@@ -624,25 +674,45 @@ router.get(
         statusGroups[status].forEach((s, i) => (binds[`s${i}`] = s));
       }
 
-      // -------------------------------------------------------------------------
-      // STEP 4️⃣ — Month/year filter (reported OR worklog activity)
-      // -------------------------------------------------------------------------
-      if (month && year) {
-        const { start, end } = getMonthDateRange(Number(month), Number(year));
-        whereClauses.push(`
-          (
-            li.CREATED_AT BETWEEN :startDate AND :endDate
-            OR li.ID IN (
-              SELECT DISTINCT lic.LIVE_ISSUE_ID
-              FROM COMPONENT_WORKLOGS wl
-              JOIN LIVE_ISSUE_COMPONENTS lic
-                ON wl.TASK_COMPONENT_ID = lic.LIVE_ISSUE_COMPONENT_ID
-              WHERE wl.LOG_DATE BETWEEN :startDate AND :endDate
-            )
-          )
-        `);
-        binds.startDate = start;
-        binds.endDate = end;
+            // -------------------------------------------------------------------------
+// STEP 4 — Month/year filter (CORRECTED)
+// -------------------------------------------------------------------------
+if (month && year) {
+  const { start, end } = getMonthDateRange(Number(month), Number(year));
+
+  whereClauses.push(`
+    (
+      -- 🟢 Always show pending issues (even from previous months)
+      li.STATUS IN ('Open', 'WIP', 'Pending')
+
+      OR
+
+      -- 🔵 Issues created this month
+      li.DATE_REPORTED BETWEEN :startDate AND :endDate
+
+      OR
+
+      -- 🟣 Issues worked on this month
+      li.ID IN (
+        SELECT DISTINCT lic.LIVE_ISSUE_ID
+        FROM COMPONENT_WORKLOGS wl
+        JOIN LIVE_ISSUE_COMPONENTS lic
+          ON wl.TASK_COMPONENT_ID = lic.LIVE_ISSUE_COMPONENT_ID
+        WHERE wl.LOG_DATE BETWEEN :startDate AND :endDate
+      )
+
+      OR
+
+      -- 🟠 Completed issues closed this month
+      (
+        li.STATUS = 'Completed'
+        AND li.CLOSED_AT BETWEEN :startDate AND :endDate
+      )
+    )
+  `);
+
+  binds.startDate = start;
+  binds.endDate = end;
       }
 
       if (sqlCondition) whereClauses.push(sqlCondition.replace(/^ AND /, ""));
@@ -666,11 +736,13 @@ router.get(
         SELECT
           li.*,
           e.NAME AS EMPLOYEE_NAME,
+          p.NAME AS PROJECT_NAME,
           e.DESIGNATION AS EMPLOYEE_DESIGNATION,
           e.EMAIL AS EMPLOYEE_EMAIL
         FROM LIVE_ISSUES li
         LEFT JOIN EMPLOYEES e
           ON li.ASSIGNED_EMPLOYEE_ID = e.ID
+        LEFT JOIN PROJECTS p ON li.PROJECT_ID = p.ID
         ${whereSQL}
         ${orderBy}
       `;
@@ -691,6 +763,7 @@ router.get(
         dateReported:row.DATE_REPORTED,
         applicationName: row.APPLICATION_NAME,
         moduleName: row.MODULE_NAME,
+        projectName: row.PROJECT_NAME,
         subModule: row.SUB_MODULE,
         shortDescription: row.SHORT_DESCRIPTION,
         issueDetails: row.ISSUE_DETAILS,
@@ -879,41 +952,43 @@ if (status) {
       // SQL
       // -------------------------------------------------------
       const sql = `
-        SELECT
-          li.id,
-          li.short_description,
-          li.issue_details,
-          li.application_name,
-          li.module_name,
-          li.status,
-          li.uat_eta_date,
-          li.fix_date,
-          li.closed_at,
-          li.completed_at,
-          NVL(li.workload_hours, 0) AS workload_hours
-        FROM live_issues li
-        JOIN employees e
-          ON li.assigned_employee_id = e.id
-        WHERE li.assigned_employee_id = :empId
-          ${statusSQL}
-          AND (
-            TRUNC(li.uat_eta_date)
-              BETWEEN :startDate AND :endDate
-            OR EXISTS (
-              SELECT 1
-              FROM component_worklogs cw
-              JOIN live_issue_components lic
-                ON cw.task_component_id = lic.live_issue_component_id
-              WHERE lic.live_issue_id = li.id
-                AND TRUNC(cw.log_date)
-                    BETWEEN :startDate AND :endDate
-            )
-          )
-        ORDER BY
-          li.uat_eta_date NULLS LAST,
-          li.created_at DESC
-      `;
-
+SELECT
+  li.id,
+  li.created_at,
+  li.short_description,
+  li.issue_details,
+  li.application_name,
+  li.module_name,
+  li.status,
+  li.uat_eta_date,
+  li.fix_date,
+  li.closed_at,
+  li.completed_at,
+  NVL(li.workload_hours, 0) AS workload_hours
+FROM live_issues li
+JOIN employees e
+  ON li.assigned_employee_id = e.id
+WHERE li.assigned_employee_id = :empId
+  ${statusSQL}
+  AND (
+    (
+      li.status IN ('Open','WIP','Pending')
+      AND li.created_at <= :endDate
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM component_worklogs cw
+      JOIN live_issue_components lic
+        ON cw.task_component_id = lic.live_issue_component_id
+      WHERE lic.live_issue_id = li.id
+        AND cw.log_date BETWEEN :startDate AND :endDate
+    )
+    OR li.created_at BETWEEN :startDate AND :endDate
+  )
+ORDER BY
+  li.uat_eta_date NULLS LAST,
+  li.created_at DESC
+`;
       const result = await conn.execute(sql, binds, {
         outFormat: oracledb.OUT_FORMAT_OBJECT,
       });
@@ -943,9 +1018,6 @@ if (status) {
     });
   }
 );
-
-
-
 
 //route to update a live issue by id
 router.patch(
@@ -1000,6 +1072,34 @@ router.patch(
       // STEP 3️⃣ — Prepare update payload
       // -------------------------------------------------------------------------
       let updateData = { ...req.body };
+
+      const moduleRes = await connection.execute(
+  `SELECT name FROM modules WHERE id = :id`,
+  { id: Number(updateData.moduleId) }
+);
+const resolvedModuleName = moduleRes.rows[0][0];
+
+let applicationName = updateData.applicationName;
+let finalApplicationName = applicationName;
+if (Number(applicationName) && applicationName !== "all") {
+  const appRes = await connection.execute(
+    `SELECT name FROM applications WHERE id = :id`,
+    { id: Number(applicationName) },
+    { outFormat: oracledb.OUT_FORMAT_OBJECT }
+  );
+
+  if (appRes.rows.length > 0) {
+    finalApplicationName = appRes.rows[0].NAME;
+  }
+}
+
+if (updateData.moduleId) {
+  updateData.moduleName = resolvedModuleName;
+}
+
+if(updateData.applicationName) {
+  updateData.applicationName = finalApplicationName;
+}
       // -------------------------------------------------------------------------
       // STEP 4️⃣ — Handle component updates
       // -------------------------------------------------------------------------
@@ -1095,18 +1195,26 @@ router.patch(
 
         await connection.commit();
       }
+      
       const fieldMap = {
-  employeeId: "E_ID",
+  applicationName: "APPLICATION_NAME",
+  moduleName: "MODULE_NAME",
   projectId: "PROJECT_ID",
-  moduleId: "MODULE_ID",
-  title: "TITLE",
-  description: "DESCRIPTION",
-  dueDate: "DUE_DATE",
+  subModule: "SUB_MODULE",
+  reportedBy: "REPORTED_BY",
+  reportingGroup: "REPORTING_GROUP",
+  shortDescription: "SHORT_DESCRIPTION",
+  issueDetails: "ISSUE_DETAILS",
+  category: "CATEGORY",
   priority: "PRIORITY",
   status: "STATUS",
+  remarks: "REMARKS",
+  assignedEmployeeId: "ASSIGNED_EMPLOYEE_ID",
+  uatEtaDate: "UAT_ETA_DATE",
+  dateReported: "DATE_REPORTED",
   WORKLOAD_HOURS: "WORKLOAD_HOURS",
-  completedAt: "COMPLETED_AT",
 };
+
 
       // -------------------------------------------------------------------------
       // STEP 5️⃣ — FIXED normal task update (this was the bug)
@@ -1121,6 +1229,13 @@ if (updateData.dueDate) {
 if (updateData.completedAt) {
   updateData.completedAt = new Date(updateData.completedAt);
 }
+if (updateData.uatEtaDate) {
+  updateData.uatEtaDate = new Date(updateData.uatEtaDate);
+}
+if (updateData.dateReported) {
+  updateData.dateReported = new Date(updateData.dateReported);
+}
+
 
 Object.entries(updateData).forEach(([key, value]) => {
   const dbColumn = fieldMap[key] || fieldMap[key.toUpperCase()];
