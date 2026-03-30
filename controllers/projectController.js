@@ -1,4 +1,5 @@
 const oracledb = require("oracledb");
+const {buildVisibilityOracle} = require('../utils/visibilityOracle')
 
 // Helper for UI date formatting
 const formatDate = (date) => {
@@ -119,7 +120,7 @@ exports.createProject = async (req, res) => {
     connection = await oracledb.getConnection();
     
     const {
-      moduleId, name, description, startDate,
+      moduleId,applicationName, name, description, startDate,
       plannedEndDate, priority, projectStage = "BRS_Discussion",
       days, dependencyOn, bsgRemarks, techFprTl,
       businessFprTl, bsgFpr, platform, crNumbers,
@@ -171,10 +172,22 @@ exports.createProject = async (req, res) => {
       sprintEndDate = null;
       manDaysValue = manDaysValue || (validEnd ? await calculateManDays(sprintStartDate, validEnd) : null);
     }
-
+    let finalApplicationName = applicationName;
+            if (Number(applicationName) && applicationName !== "all") {
+              const appRes = await connection.execute(
+                `SELECT name FROM applications WHERE id = :id`,
+                { id: Number(applicationName) },
+                { outFormat: oracledb.OUT_FORMAT_OBJECT }
+              );
+            
+              if (appRes.rows.length > 0) {
+                finalApplicationName = appRes.rows[0].NAME;
+              }
+            }
     // ------------------ Bind Variables ------------------
     const binds = {
       moduleId: moduleId || null,
+      applicationName: finalApplicationName || null,
       name: name || null,
       description: description || null,
       startDate: finalStartDate,
@@ -204,13 +217,13 @@ exports.createProject = async (req, res) => {
     // ------------------ Insert Project ------------------
     const insertQuery = `
       INSERT INTO projects (
-        id, module_id, name, description, start_date, planned_end_date, manager_id,
+        id, module_id, application_name, name, description, start_date, planned_end_date, manager_id,
         priority, project_stage, dependency_on, bsg_remarks, tech_fpr_tl,
         business_fpr_tl, bsg_fpr, platform, cr_numbers, roi, brs_filename,
         project_cost, sprint_start_date, sprint_end_date, man_days,
         on_track_status, remarks, team
       ) VALUES (
-        projects_seq.NEXTVAL, :moduleId, :name, :description, :startDate, :plannedEndDate, :managerId,
+        projects_seq.NEXTVAL, :moduleId, :applicationName, :name, :description, :startDate, :plannedEndDate, :managerId,
         :priority, :projectStage, :dependencyOn, :bsgRemarks, :techFprTl,
         :businessFprTl, :bsgFpr, :platform, :crNumbers, :roi, :brsFilename,
         :projectCost, :sprintStartDate, :sprintEndDate, :manDays,
@@ -225,7 +238,7 @@ exports.createProject = async (req, res) => {
       message: "Project created successfully",
       project: {
         id: projectId,
-        moduleId, name, description,
+        moduleId,applicationName, name, description,
         startDate: finalStartDate,
         plannedEndDate: validEnd,
         sprintStartDate, sprintEndDate,
@@ -246,58 +259,6 @@ exports.createProject = async (req, res) => {
   }
 };
 
-
-// Helper function to fetch projects with optional filters
-async function fetchProjects(managerId, filters = {}, connection) {
-  let query = `
-    SELECT 
-      p.*, 
-      m.name AS module_name,
-      e.name AS tech_tl_name
-    FROM projects p
-    LEFT JOIN modules m ON p.module_id = m.id
-    LEFT JOIN employees e ON p.tech_fpr_tl = e.id
-    WHERE p.manager_id = :managerId
-  `;
-
-  const bindParams = { managerId };
-
-  // Dynamic filters
-  if (filters.moduleId) {
-    query += ` AND p.module_id = :moduleId`;
-    bindParams.moduleId = filters.moduleId;
-  }
-  if (filters.priority) {
-    query += ` AND p.priority = :priority`;
-    bindParams.priority = filters.priority;
-  }
-  if (filters.projectStage) {
-    query += ` AND p.project_stage = :projectStage`;
-    bindParams.projectStage = filters.projectStage;
-  }
-  if (filters.onTrackStatus) {
-    query += ` AND p.on_track_status = :onTrackStatus`;
-    bindParams.onTrackStatus = filters.onTrackStatus;
-  }
-  if (filters.startDateFrom) {
-    query += ` AND p.start_date >= TO_DATE(:startDateFrom, 'YYYY-MM-DD')`;
-    bindParams.startDateFrom = filters.startDateFrom;
-  }
-  if (filters.startDateTo) {
-    query += ` AND p.start_date <= TO_DATE(:startDateTo, 'YYYY-MM-DD')`;
-    bindParams.startDateTo = filters.startDateTo;
-  }
-
-  query += ` ORDER BY p.created_at DESC`;
-
-  const result = await connection.execute(query, bindParams, {
-    outFormat: oracledb.OUT_FORMAT_OBJECT,
-  });
-  return result.rows;
-}
-
-
-// ---------------------------
 // GET all projects with analytics
 const toCamelCase = (obj) => {
   if (!obj) return obj;
@@ -310,45 +271,158 @@ const toCamelCase = (obj) => {
 
 exports.getProjects = async (req, res) => {
   let connection;
+
   try {
     connection = await oracledb.getConnection();
-    const managerId = req.user.managerId || req.user.id;
 
+    const user = req.user;
+    const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
     const filters = {
       moduleId: req.query.moduleId,
       priority: req.query.priority,
       projectStage: req.query.projectStage,
       onTrackStatus: req.query.onTrackStatus,
       startDateFrom: req.query.startDateFrom,
-      startDateTo: req.query.startDateTo
+      startDateTo: req.query.startDateTo,
+      applicationId: req.query.applicationId
     };
 
-    let projects = await fetchProjects(managerId, filters, connection);
+/* ---------------------------------------------------------
+   1️⃣ Build visibility WHERE clause
+--------------------------------------------------------- */
 
-    // Map Oracle uppercase to camelCase
-    projects = projects.map(toCamelCase);
+let where = "";
+let finalBinds = { ...binds }; // start with visibility binds
+
+if (req.user.role === "admin" || req.user.role === "employee") {
+  // TL → show projects of his manager's modules
+  where = `
+    WHERE m.manager_id = (
+      SELECT manager_id
+      FROM employees
+      WHERE id = :currentUserId
+    )
+  `;
+  finalBinds = {
+    currentUserId: req.user.id
+  };
+} else {
+  // Normal hierarchy visibility
+  where = `
+    WHERE m.manager_id IN (
+      SELECT e.id
+      FROM employees e
+      WHERE 1=1
+      ${sqlCondition}
+    )
+  `;
+}
+
+   if (filters.moduleId) {
+  where += ` AND p.module_id = :moduleId`;
+  finalBinds.moduleId = Number(filters.moduleId);
+}
+
+if (filters.applicationId && filters.applicationId !== "all") {
+  where += ` AND m.application_id = :applicationId`;
+  finalBinds.applicationId = Number(filters.applicationId);
+}
+
+if (filters.priority) {
+  where += ` AND p.priority = :priority`;
+  finalBinds.priority = filters.priority;
+}
+
+if (filters.projectStage) {
+  where += ` AND p.project_stage = :projectStage`;
+  finalBinds.projectStage = filters.projectStage;
+}
+
+if (filters.startDateFrom) {
+  where += ` AND p.start_date >= TO_DATE(:startDateFrom, 'YYYY-MM-DD')`;
+  finalBinds.startDateFrom = filters.startDateFrom;
+}
+
+if (filters.startDateTo) {
+  where += ` AND p.start_date <= TO_DATE(:startDateTo, 'YYYY-MM-DD')`;
+  finalBinds.startDateTo = filters.startDateTo;
+}
+
+    /* ---------------------------------------------------------
+       2️⃣ Fetch Projects
+    --------------------------------------------------------- */
+
+    const query = `
+  SELECT
+    p.*,
+    m.name AS module_name,
+    e.name AS tech_tl_name,
+    m.application_id
+  FROM projects p
+  JOIN modules m ON m.id = p.module_id
+  LEFT JOIN employees e ON p.tech_fpr_tl = e.id
+  ${where}
+  ORDER BY p.created_at DESC
+`;
+
+const result = await connection.execute(
+  query,
+  finalBinds,
+  { outFormat: oracledb.OUT_FORMAT_OBJECT }
+);
+
+
+
+    let projects = result.rows.map(toCamelCase);
+
+    /* ---------------------------------------------------------
+       3️⃣ Real-Time Status Calculation
+    --------------------------------------------------------- */
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const computeOnTrackStatus = (plannedEnd) => {
+      if (!plannedEnd) return "On Track";
+
+      const planned = new Date(plannedEnd);
+      if (isNaN(planned.getTime())) return "On Track";
+
+      planned.setHours(0, 0, 0, 0);
+      return today > planned ? "Delayed" : "On Track";
+    };
 
     const updatedProjects = [];
-    for (let project of projects) {
-      const updates = updateTrackingStatus(project);
-      if (Object.keys(updates).length > 0) {
-        // Convert updates keys to uppercase for Oracle
-        const oracleUpdates = {};
-        for (let k in updates) {
-          const upperKey = k.replace(/([A-Z])/g, "_$1").toUpperCase();
-          oracleUpdates[upperKey] = updates[k];
-        }
 
-        const updateQuery = `
+    for (let project of projects) {
+      const storedStatus = project.onTrackStatus;
+      const computedStatus = computeOnTrackStatus(project.plannedEndDate);
+
+      // Always return real-time value
+      project.onTrackStatus = computedStatus;
+
+      // Sync DB only if mismatch
+      if (storedStatus !== computedStatus) {
+        await connection.execute(
+          `
           UPDATE projects
-          SET ${Object.keys(oracleUpdates).map(k => `${k} = :${k}`).join(", ")}
-          WHERE ID = :projectId
-        `;
-        await connection.execute(updateQuery, { ...oracleUpdates, projectId: project.id }, { autoCommit: true });
-        Object.assign(project, updates); // update local copy
+          SET on_track_status = :status
+          WHERE id = :projectId
+          `,
+          {
+            status: computedStatus,
+            projectId: project.id
+          },
+          { autoCommit: true }
+        );
       }
+
       updatedProjects.push(await formatProjectDates(project));
     }
+
+    /* ---------------------------------------------------------
+       4️⃣ Analytics
+    --------------------------------------------------------- */
 
     const analytics = {
       total: updatedProjects.length,
@@ -368,7 +442,7 @@ exports.getProjects = async (req, res) => {
         return acc;
       }, {})
     };
-    
+
     res.json({
       projects: updatedProjects,
       analytics,
@@ -376,31 +450,95 @@ exports.getProjects = async (req, res) => {
     });
 
   } catch (err) {
-    console.error(err);
+    console.error("Failed to fetch projects:", err);
     res.status(500).json({ error: err.message });
   } finally {
     if (connection) await connection.close();
   }
 };
 
+
 // ---------------------------
 // GET project names only
 exports.getProjectNames = async (req, res) => {
   let connection;
+
   try {
     connection = await oracledb.getConnection();
-    const managerId = req.user.managerId || req.user.id;
+
+    const user = req.user;
+    const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
+
+    const { applicationId, moduleId } = req.query;
+
+    /* ---------------------------------------------------------
+       1️⃣ Build visibility WHERE clause
+    --------------------------------------------------------- */
+
+    let where = "";
+    let finalBinds = {};
+
+    if (user.role === "admin" || user.role === "employee") {
+      // TL → show projects of his manager's modules
+      where = `
+        WHERE m.manager_id = (
+          SELECT manager_id
+          FROM employees
+          WHERE id = :currentUserId
+        )
+      `;
+
+      finalBinds.currentUserId = user.id;
+
+    } else {
+      // Normal hierarchy visibility
+      where = `
+        WHERE m.manager_id IN (
+          SELECT e.id
+          FROM employees e
+          WHERE 1=1
+          ${sqlCondition}
+        )
+      `;
+
+      finalBinds = { ...binds };
+    }
+
+    /* ---------------------------------------------------------
+       2️⃣ Optional Filters
+    --------------------------------------------------------- */
+
+    if (applicationId && applicationId !== "all") {
+      where += ` AND m.application_id = :applicationId`;
+      finalBinds.applicationId = Number(applicationId);
+    }
+
+    if (moduleId) {
+      where += ` AND p.module_id = :moduleId`;
+      finalBinds.moduleId = Number(moduleId);
+    }
+
+    /* ---------------------------------------------------------
+       3️⃣ Execute Query
+    --------------------------------------------------------- */
+
+    const query = `
+      SELECT
+        p.id,
+        p.module_id,
+        p.name
+      FROM projects p
+      JOIN modules m ON m.id = p.module_id
+      ${where}
+      ORDER BY p.created_at DESC
+    `;
 
     const result = await connection.execute(
-      `SELECT id, module_id, name 
-       FROM projects 
-       WHERE manager_id = :managerId 
-       ORDER BY created_at DESC`,
-      { managerId },
+      query,
+      finalBinds,
       { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
 
-    // Convert to camelCase
     const projects = result.rows.map(row => ({
       id: row.ID,
       moduleId: row.MODULE_ID,
@@ -408,11 +546,15 @@ exports.getProjectNames = async (req, res) => {
     }));
 
     res.json(projects);
+
   } catch (err) {
-    console.error(err);
+    console.error("Failed to fetch project names:", err);
     res.status(500).json({ error: err.message });
   } finally {
-    if (connection) await connection.close();
+    if (connection) {
+      try { await connection.close(); }
+      catch (err) { console.error(err); }
+    }
   }
 };
 
@@ -552,7 +694,9 @@ exports.updateProject = async (req, res) => {
       module_id: req.body.moduleId ?? currentProject.MODULE_ID,
       name: req.body.name ?? currentProject.NAME,
       description: req.body.description ?? currentProject.DESCRIPTION,
-      start_date: req.body.startDate ? parseDate(req.body.startDate) : currentProject.START_DATE,
+      start_date: req.body.startDate
+        ? parseDate(req.body.startDate)
+        : currentProject.START_DATE,
       planned_end_date: req.body.plannedEndDate
         ? parseDate(req.body.plannedEndDate)
         : currentProject.PLANNED_END_DATE,
@@ -562,7 +706,8 @@ exports.updateProject = async (req, res) => {
       dependency_on: req.body.dependencyOn ?? currentProject.DEPENDENCY_ON,
       bsg_remarks: req.body.bsgRemarks ?? currentProject.BSG_REMARKS,
       tech_fpr_tl: req.body.techFprTl ?? currentProject.TECH_FPR_TL,
-      business_fpr_tl: req.body.businessFprTl ?? currentProject.BUSINESS_FPR_TL,
+      business_fpr_tl:
+        req.body.businessFprTl ?? currentProject.BUSINESS_FPR_TL,
       bsg_fpr: req.body.bsgFpr ?? currentProject.BSG_FPR,
       platform: req.body.platform ?? currentProject.PLATFORM,
       cr_numbers: req.body.crNumbers ?? currentProject.CR_NUMBERS,
@@ -571,50 +716,103 @@ exports.updateProject = async (req, res) => {
       project_cost: req.body.projectCost ?? currentProject.PROJECT_COST,
       remarks: req.body.remarks ?? currentProject.REMARKS,
       discussion_delay_reason:
-        req.body.discussionDelayReason ?? currentProject.DISCUSSION_DELAY_REASON,
+        req.body.discussionDelayReason ??
+        currentProject.DISCUSSION_DELAY_REASON,
       team: req.body.team ?? currentProject.TEAM,
     };
 
     // --------------------------------------------------
-    // Auto compute on_track_status on EVERY edit
+    // STAGE TRANSITION LOGIC (FIX)
+    // --------------------------------------------------
+    const stages = [
+      "BRS_Discussion",
+      "Approach_Preparation",
+      "Approach_Finalization",
+      "Under_Development",
+      "Under_QA",
+      "Under_UAT",
+      "UAT_Signoff",
+      "Under_Preprod",
+      "Preprod_Signoff",
+      "Live",
+    ];
+
+    const oldStageIndex = stages.indexOf(currentProject.PROJECT_STAGE);
+    const newStageIndex = stages.indexOf(allowedFields.project_stage);
+
+    // Sprint dates
+    if (newStageIndex >= stages.indexOf("Under_Development")) {
+      allowedFields.sprint_start_date =
+        currentProject.SPRINT_START_DATE ||
+        (allowedFields.project_stage === "Under_Development" ? today : null);
+
+      allowedFields.sprint_end_date =
+        currentProject.PROJECT_STAGE === "Under_Development" &&
+        newStageIndex > oldStageIndex
+          ? today
+          : currentProject.SPRINT_END_DATE || null;
+    } else {
+      allowedFields.sprint_start_date = null;
+      allowedFields.sprint_end_date = null;
+    }
+
+    // UAT release date
+    const uatIndex = stages.indexOf("UAT_Signoff");
+    allowedFields.uat_release_date =
+      oldStageIndex < uatIndex && newStageIndex >= uatIndex
+        ? currentProject.UAT_RELEASE_DATE || today
+        : newStageIndex < uatIndex
+        ? null
+        : currentProject.UAT_RELEASE_DATE;
+
+    // Go-live date
+    const liveIndex = stages.indexOf("Live");
+    allowedFields.go_live_end_date =
+      oldStageIndex < liveIndex && newStageIndex >= liveIndex
+        ? currentProject.GO_LIVE_END_DATE || today
+        : newStageIndex < liveIndex
+        ? null
+        : currentProject.GO_LIVE_END_DATE;
+
+    // Man-days
+    allowedFields.man_days =
+      allowedFields.start_date && allowedFields.planned_end_date
+        ? await calculateManDays(
+            allowedFields.start_date,
+            allowedFields.planned_end_date
+          )
+        : currentProject.MAN_DAYS;
+
+    // --------------------------------------------------
+    // Auto compute on_track_status
     // --------------------------------------------------
     allowedFields.on_track_status = computeOnTrackStatus(
       allowedFields.planned_end_date
     );
 
-// --------------------------------------------------
-// --------------------------------------------------
-// PROJECT_CHANGES_RECEIVED (MERGE, NOT OVERWRITE)
-// --------------------------------------------------
+    // --------------------------------------------------
+    // PROJECT_CHANGES_RECEIVED (MERGE)
+    // --------------------------------------------------
+    const existingChanges = await parseClobJson(
+      currentProject.PROJECT_CHANGES_RECEIVED
+    );
 
-// 1️⃣ Read existing DB changes
-let existingChanges = await parseClobJson(
-  currentProject.PROJECT_CHANGES_RECEIVED
-);
+    const incomingChanges = Array.isArray(req.body.projectChangesReceived)
+      ? req.body.projectChangesReceived.map((c) => ({
+          date: c.date,
+          stage: c.stage,
+          details: c.details,
+          updatedBy,
+          timestamp: c.timestamp || new Date().toISOString(),
+        }))
+      : [];
 
-// 2️⃣ Read incoming changes from frontend
-let incomingChanges = Array.isArray(req.body.projectChangesReceived)
-  ? req.body.projectChangesReceived
-  : [];
-
-// 3️⃣ Normalize incoming entries
-incomingChanges = incomingChanges.map((c) => ({
-  date: c.date,
-  stage: c.stage,
-  details: c.details,
-  updatedBy,
-  timestamp: c.timestamp || new Date().toISOString(),
-}));
-
-// 4️⃣ Merge (append new → keep old)
-const mergedChanges = [...existingChanges, ...incomingChanges];
-
-// 5️⃣ Store
-const finalProjectChangesReceived =
-  mergedChanges.length > 0 ? JSON.stringify(mergedChanges) : null;
+    const mergedChanges = [...existingChanges, ...incomingChanges];
+    const finalProjectChangesReceived =
+      mergedChanges.length > 0 ? JSON.stringify(mergedChanges) : null;
 
     // --------------------------------------------------
-    // Compute change_log (system audit)
+    // CHANGE LOG (SYSTEM AUDIT)
     // --------------------------------------------------
     const changes = {};
     for (const [key, newValue] of Object.entries(allowedFields)) {
@@ -628,7 +826,8 @@ const finalProjectChangesReceived =
         (!isNaN(Date.parse(oldNorm)) && !isNaN(Date.parse(newNorm)));
 
       const different = isDate
-        ? new Date(oldNorm || 0).getTime() !== new Date(newNorm || 0).getTime()
+        ? new Date(oldNorm || 0).getTime() !==
+          new Date(newNorm || 0).getTime()
         : oldNorm !== newNorm;
 
       if (different) {
@@ -636,7 +835,7 @@ const finalProjectChangesReceived =
       }
     }
 
-    let changeLog = await parseClobJson(currentProject.CHANGE_LOG);
+    const changeLog = await parseClobJson(currentProject.CHANGE_LOG);
     if (Object.keys(changes).length) {
       changeLog.push({
         timestamp: new Date(),
@@ -672,6 +871,11 @@ const finalProjectChangesReceived =
         remarks = :remarks,
         discussion_delay_reason = :discussion_delay_reason,
         team = :team,
+        sprint_start_date = :sprint_start_date,
+        sprint_end_date = :sprint_end_date,
+        uat_release_date = :uat_release_date,
+        go_live_end_date = :go_live_end_date,
+        man_days = :man_days,
         on_track_status = :on_track_status,
         project_changes_received = :project_changes_received,
         updated_at = SYSTIMESTAMP,
@@ -705,7 +909,6 @@ const finalProjectChangesReceived =
       updatedBy,
       changes,
     });
-
   } catch (err) {
     console.error(err);
     res.status(400).json({ error: err.message });
@@ -713,7 +916,6 @@ const finalProjectChangesReceived =
     if (connection) await connection.close();
   }
 };
-
 
 // Delete Project
 exports.deleteProject = async (req, res) => {
@@ -773,64 +975,155 @@ exports.deleteProject = async (req, res) => {
 // Get project analytics
 exports.getProjectAnalytics = async (req, res) => {
   let connection;
+
   try {
     connection = await oracledb.getConnection();
-    const managerId = req.user.managerId || req.user.id;
+
+    const user = req.user;
+    const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
+    const { applicationId } = req.query;
+
+    /* ---------------------------------------------------------
+       1️⃣ Build visibility WHERE clause
+    --------------------------------------------------------- */
+
+    let where = "";
+    let finalBinds = {};
+
+    if (user.role === "admin") {
+      // TL → show analytics of his manager's modules
+      where = `
+        WHERE m.manager_id = (
+          SELECT manager_id
+          FROM employees
+          WHERE id = :currentUserId
+        )
+      `;
+      finalBinds.currentUserId = user.id;
+    } else {
+      // Normal hierarchy visibility
+      where = `
+        WHERE m.manager_id IN (
+          SELECT e.id
+          FROM employees e
+          WHERE 1=1
+          ${sqlCondition}
+        )
+      `;
+      finalBinds = { ...binds };
+    }
+
+    /* ---------------------------------------------------------
+       2️⃣ Optional Application Filter
+    --------------------------------------------------------- */
+
+    if (applicationId && applicationId !== "all") {
+      where += ` AND m.application_id = :applicationId`;
+      finalBinds.applicationId = Number(applicationId);
+    }
+
+    /* ---------------------------------------------------------
+       3️⃣ Fetch Projects via Modules
+    --------------------------------------------------------- */
+
+    const query = `
+      SELECT
+        p.*,
+        m.name AS module_name,
+        m.application_id
+      FROM projects p
+      JOIN modules m ON p.module_id = m.id
+      ${where}
+    `;
 
     const result = await connection.execute(
-      `SELECT p.*, m.name AS module_name
-       FROM projects p
-       LEFT JOIN modules m ON p.module_id = m.id
-       WHERE p.manager_id = :managerId`,
-      { managerId },
+      query,
+      finalBinds,
       { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
 
     const projects = result.rows || [];
 
+    /* ---------------------------------------------------------
+       4️⃣ Analytics Computation
+    --------------------------------------------------------- */
+
     const analytics = {
       overview: {
         total: projects.length,
-        active: projects.filter(p => !["Live", "Hold", "Dropped"].includes(p.PROJECT_STAGE)).length,
-        completed: projects.filter(p => p.PROJECT_STAGE === "Live").length,
-        delayed: projects.filter(p => p.ON_TRACK_STATUS === "Delayed").length,
+        active: projects.filter(p =>
+          !["Live", "Hold", "Dropped"].includes(p.PROJECT_STAGE)
+        ).length,
+        completed: projects.filter(p =>
+          p.PROJECT_STAGE === "Live"
+        ).length,
+        delayed: projects.filter(p =>
+          p.ON_TRACK_STATUS === "Delayed"
+        ).length,
       },
+
       byModule: projects.reduce((acc, project) => {
         const moduleName = project.MODULE_NAME || "Unknown";
         acc[moduleName] = (acc[moduleName] || 0) + 1;
         return acc;
       }, {}),
+
       timeline: {
         thisMonth: projects.filter(p => {
+          if (!p.START_DATE) return false;
           const start = new Date(p.START_DATE);
           const now = new Date();
-          return start.getMonth() === now.getMonth() && start.getFullYear() === now.getFullYear();
+          return (
+            start.getMonth() === now.getMonth() &&
+            start.getFullYear() === now.getFullYear()
+          );
         }).length,
+
         nextMonth: projects.filter(p => {
+          if (!p.PLANNED_END_DATE) return false;
           const end = new Date(p.PLANNED_END_DATE);
           const nextMonth = new Date();
           nextMonth.setMonth(nextMonth.getMonth() + 1);
-          return end.getMonth() === nextMonth.getMonth() && end.getFullYear() === nextMonth.getFullYear();
+          return (
+            end.getMonth() === nextMonth.getMonth() &&
+            end.getFullYear() === nextMonth.getFullYear()
+          );
         }).length,
       },
+
       costs: {
-        total: projects.reduce((sum, p) => sum + (p.PROJECT_COST || 0), 0),
-        average: projects.length > 0 ? projects.reduce((sum, p) => sum + (p.PROJECT_COST || 0), 0) / projects.length : 0,
+        total: projects.reduce(
+          (sum, p) => sum + (p.PROJECT_COST || 0),
+          0
+        ),
+
+        average:
+          projects.length > 0
+            ? projects.reduce(
+                (sum, p) => sum + (p.PROJECT_COST || 0),
+                0
+              ) / projects.length
+            : 0,
+
         byPriority: projects.reduce((acc, project) => {
           const priority = project.PRIORITY || "Unknown";
-          acc[priority] = (acc[priority] || 0) + (project.PROJECT_COST || 0);
+          acc[priority] =
+            (acc[priority] || 0) + (project.PROJECT_COST || 0);
           return acc;
         }, {}),
-      }
+      },
     };
 
     res.json(analytics);
+
   } catch (err) {
-    console.error(err);
+    console.error("Failed to fetch project analytics:", err);
     res.status(500).json({ error: err.message });
   } finally {
     if (connection) {
-      try { await connection.close(); } catch (err) { console.error(err); }
+      try { await connection.close(); }
+      catch (err) { console.error(err); }
     }
   }
 };
+
