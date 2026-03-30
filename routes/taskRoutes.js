@@ -91,6 +91,7 @@ router.post(
       conn.autoCommit = false;
 
       const {
+        applicationName,
         moduleId,
         projectId,
         employeeId,
@@ -148,16 +149,28 @@ router.post(
         ? new Date()
         : null;
 
+        let finalApplicationName = applicationName;
+        if (Number(applicationName) && applicationName !== "all") {
+          const appRes = await conn.execute(
+            `SELECT name FROM applications WHERE id = :id`,
+            { id: Number(applicationName) },
+            { outFormat: oracledb.OUT_FORMAT_OBJECT }
+          );
+        
+          if (appRes.rows.length > 0) {
+            finalApplicationName = appRes.rows[0].NAME;
+          }
+        }
       // ------------------------------------------------------------
       // 3️⃣ INSERT TASK USING SEQ_TASK
       // ------------------------------------------------------------
       const insertTaskSql = `
         INSERT INTO TASKS
-          (TASK_ID, MODULE_ID, PROJECT_ID, E_ID, MANAGER_ID, TITLE, DESCRIPTION,
+          (TASK_ID, APPLICATION_NAME, MODULE_ID, PROJECT_ID, E_ID, MANAGER_ID, TITLE, DESCRIPTION,
            DUE_DATE, PRIORITY, STATUS, WORKLOAD_HOURS, COMPLETED_AT,
            CREATED_AT, UPDATED_AT)
         VALUES
-          (SEQ_TASK.NEXTVAL, :moduleId, :projectId, :employeeId, :managerId,
+          (SEQ_TASK.NEXTVAL, :finalApplicationName, :moduleId, :projectId, :employeeId, :managerId,
            :title, :description, TO_DATE(:dueDate,'YYYY-MM-DD'),
            :priority, :status, :workloadHours, :completedAt,
            SYSTIMESTAMP, SYSTIMESTAMP)
@@ -167,6 +180,7 @@ router.post(
       const taskInsertResult = await conn.execute(
         insertTaskSql,
         {
+          finalApplicationName: finalApplicationName,
           moduleId: Number(moduleId),
           projectId: Number(projectId),
           employeeId: Number(employeeId),
@@ -798,7 +812,6 @@ router.get(
       // STEP 1️⃣ — Apply centralized visibility + hierarchy filter
       // -------------------------------------------------------------------------
       const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
-
       // -------------------------------------------------------------------------
       // STEP 2️⃣ — Dynamic filters
       // -------------------------------------------------------------------------
@@ -829,21 +842,33 @@ router.get(
       // STEP 3️⃣ — Month/year filter (due date or worklog activity)
       // -------------------------------------------------------------------------
       if (month && year) {
-        const { start, end } = getMonthDateRange(Number(month), Number(year));
-        whereClauses.push(`
-          (
-            t.DUE_DATE BETWEEN :startDate AND :endDate
-            OR t.TASK_ID IN (
-              SELECT DISTINCT tc.TASK_ID
-              FROM COMPONENT_WORKLOGS wl
-              JOIN TASK_COMPONENTS tc ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
-              WHERE wl.LOG_DATE BETWEEN :startDate AND :endDate
-            )
-          )
-        `);
-        binds.startDate = start;
-        binds.endDate = end;
-      }
+  const { start, end } = getMonthDateRange(Number(month), Number(year));
+
+  whereClauses.push(`
+    (
+      (
+        t.STATUS NOT IN ('Live', 'Preprod_Signoff', 'Completed')
+        AND t.DUE_DATE < :startDate
+      )
+      OR t.DUE_DATE BETWEEN :startDate AND :endDate
+      OR (
+     t.STATUS NOT IN ('Live', 'Preprod_Signoff', 'Completed')
+    AND EXISTS (
+        SELECT 1
+        FROM COMPONENT_WORKLOGS wl
+        JOIN TASK_COMPONENTS tc
+          ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
+        WHERE tc.TASK_ID = t.TASK_ID
+    )
+)
+
+    )
+  `);
+
+  binds.startDate = start;
+  binds.endDate = end;
+}
+
 
       // Append centralized condition
       if (sqlCondition) whereClauses.push(sqlCondition.replace(/^ AND /, ""));
@@ -890,6 +915,7 @@ router.get(
       let tasks = result.rows.map((row) => {
         const task = {
           taskId: row.TASK_ID,
+          applicationName: row.APPLICATION_NAME,
           title: row.TITLE,
           description: row.DESCRIPTION,
           status: row.STATUS,
@@ -1124,21 +1150,32 @@ router.get(
       // STEP 4️⃣ — Month/year filter (due date OR worklog activity)
       // -------------------------------------------------------------------------
       if (month && year) {
-        const { start, end } = getMonthDateRange(Number(month), Number(year));
-        whereClauses.push(`
-          (
-            t.DUE_DATE BETWEEN :startDate AND :endDate
-            OR t.TASK_ID IN (
-              SELECT DISTINCT tc.TASK_ID
-              FROM COMPONENT_WORKLOGS wl
-              JOIN TASK_COMPONENTS tc ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
-              WHERE wl.LOG_DATE BETWEEN :startDate AND :endDate
-            )
-          )
-        `);
-        binds.startDate = start;
-        binds.endDate = end;
-      }
+  const { start, end } = getMonthDateRange(Number(month), Number(year));
+
+  whereClauses.push(`
+    (
+      (
+        t.STATUS NOT IN ('Live', 'Preprod_Signoff', 'Completed')
+        AND t.DUE_DATE < :startDate
+      )
+      OR t.DUE_DATE BETWEEN :startDate AND :endDate
+      OR (
+     t.STATUS NOT IN ('Live', 'Preprod_Signoff', 'Completed')
+    AND EXISTS (
+        SELECT 1
+        FROM COMPONENT_WORKLOGS wl
+        JOIN TASK_COMPONENTS tc
+          ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
+        WHERE tc.TASK_ID = t.TASK_ID
+    )
+)
+    )
+  `);
+
+  binds.startDate = start;
+  binds.endDate = end;
+}
+
 
       // Append multi-level visibility condition
       if (sqlCondition) whereClauses.push(sqlCondition.replace(/^ AND /, ""));
@@ -1184,6 +1221,7 @@ router.get(
         const task = {
           taskId: row.TASK_ID,
           title: row.TITLE,
+          applicationName: row.APPLICATION_NAME,
           description: row.DESCRIPTION,
           status: row.STATUS,
           priority: row.PRIORITY,
