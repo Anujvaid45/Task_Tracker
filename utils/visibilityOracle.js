@@ -2,21 +2,26 @@ const { ROLE } = require("./roles");
 
 function buildVisibilityOracle(user, query = {}) {
   const { role, id } = user || {};
-  const { ltId, altId, managerId, tlId, applicationName } = query || {};
+  const { ltId, altId, managerId, tlId, applicationId } = query || {};
 
   const whereClauses = [];
   const binds = {};
 
   // Optional application-level filter
-if (applicationName && String(applicationName).trim() !== "") {
+
+if (applicationId && String(applicationId).trim() !== "" && applicationId !== "all") {
   whereClauses.push(`
-    REGEXP_LIKE(
-      LOWER(e.application_name),
-      '(^|,)\\s*' || LOWER(:appName) || '\\s*(,|$)'
+    EXISTS (
+      SELECT 1
+      FROM employee_applications ea
+      WHERE ea.employee_id = e.id
+        AND ea.application_id = :appId
     )
   `);
-  binds.appName = String(applicationName).trim();
+
+  binds.appId = Number(applicationId);
 }
+
 
   // Role-based hierarchy visibility
   switch (role) {
@@ -67,7 +72,10 @@ case ROLE.ALT:
         whereClauses.push("(e.reporting_manager = :tlId OR e.id = :tlId)");
         binds.tlId = tlId;
       } else {
-        whereClauses.push("e.manager_id = :managerId");
+        whereClauses.push(`
+  (e.manager_id = :managerId OR e.id = :managerId)
+`);
+
         binds.managerId = id;
       }
       break;
