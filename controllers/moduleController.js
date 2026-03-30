@@ -1,115 +1,5 @@
-// const Module = require("../models/Module");
-// const Project = require("../models/Project");
-
-// // Create a new Module
-// exports.createModule = async (req, res) => {
-//   try {
-//     const managerId =
-//       req.user.role === "manager" ? req.user.id : req.user.managerId;
-
-//     if (!managerId) {
-//       return res.status(400).json({ error: "Manager ID not found" });
-//     }
-
-//     const module = new Module({
-//       ...req.body,
-//       managerId, // link module to the manager
-//     });
-
-//     await module.save();
-//     res.status(201).json(module);
-//   } catch (err) {
-//     res.status(400).json({ error: err.message });
-//   }
-// };
-
-// // Get all Modules (isolated by manager/admin)
-// exports.getModules = async (req, res) => {
-//   try {
-//     const managerId =
-//       req.user.role === "manager" ? req.user.id : req.user.managerId;
-
-//     if (!managerId) {
-//       return res.status(400).json({ error: "Manager ID not found" });
-//     }
-
-//     const modules = await Module.find({ managerId }).populate("projects");
-//     res.json(modules);
-//   } catch (err) {
-//     res.status(500).json({ error: err.message });
-//   }
-// };
-
-// // Get single Module by ID (check manager/admin access)
-// exports.getModuleById = async (req, res) => {
-//   try {
-//     const managerId =
-//       req.user.role === "manager" ? req.user.id : req.user.managerId;
-
-//     const module = await Module.findOne({
-//       _id: req.params.id,
-//       managerId,
-//     }).populate("projects");
-
-//     if (!module)
-//       return res.status(404).json({ error: "Module not found or access denied" });
-
-//     res.json(module);
-//   } catch (err) {
-//     res.status(500).json({ error: err.message });
-//   }
-// };
-
-// // Update Module (only manager/admin of that module)
-// exports.updateModule = async (req, res) => {
-//   try {
-//     const managerId =
-//       req.user.role === "manager" ? req.user.id : req.user.managerId;
-
-//     const module = await Module.findOneAndUpdate(
-//       { _id: req.params.id, managerId },
-//       req.body,
-//       { new: true }
-//     );
-
-//     if (!module)
-//       return res.status(404).json({ error: "Module not found or access denied" });
-
-//     res.json(module);
-//   } catch (err) {
-//     res.status(400).json({ error: err.message });
-//   }
-// };
-
-// // Delete Module (only manager/admin of that module)
-// exports.deleteModule = async (req, res) => {
-//   try {
-//     const managerId =
-//       req.user.role === "manager" ? req.user.id : req.user.managerId;
-
-//     const module = await Module.findOneAndDelete({
-//       _id: req.params.id,
-//       managerId,
-//     });
-
-//     if (!module)
-//       return res.status(404).json({ error: "Module not found or access denied" });
-
-//     // Delete related projects
-//     await Project.deleteMany({ moduleId: module._id });
-
-//     res.json({ message: "Module deleted successfully" });
-//   } catch (err) {
-//     res.status(500).json({ error: err.message });
-//   }
-// };
-
-
-//this is oracle db routes
-
-
 const oracledb = require("oracledb");
-
+const {buildVisibilityOracle} = require('../utils/visibilityOracle')
 // Helper to execute queries
 async function executeQuery(query, binds = {}, options = {}) {
   let connection;
@@ -122,36 +12,99 @@ async function executeQuery(query, binds = {}, options = {}) {
   }
 }
 
-// -----------------------------
 // Create a new Module
 exports.createModule = async (req, res) => {
   try {
-    const managerId = req.user.role === "manager" ? req.user.id : req.user.managerId;
-    if (!managerId) return res.status(400).json({ error: "Manager ID not found" });
+    const managerId =
+      req.user.role === "manager" ? req.user.id : req.user.managerId;
 
-    const { name, description } = req.body;
-    if (!name) return res.status(400).json({ error: "Module name is required" });
+    if (!managerId) {
+      return res.status(400).json({ error: "Manager ID not found" });
+    }
 
+    const { name, description, applicationId } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: "Module name is required" });
+    }
+
+    if (!applicationId) {
+      return res.status(400).json({ error: "Application is required" });
+    }
+
+    /* ----------------------------------------------------
+       1️⃣ Validate manager belongs to the application
+    ---------------------------------------------------- */
+    const validation = await executeQuery(
+      `
+      SELECT 1
+      FROM employee_applications
+      WHERE employee_id = :managerId
+        AND application_id = :applicationId
+      `,
+      { managerId, applicationId }
+    );
+
+    if (!validation.rows || validation.rows.length === 0) {
+      return res.status(403).json({
+        error: "Manager is not mapped to the selected application",
+      });
+    }
+
+    /* ----------------------------------------------------
+       2️⃣ Insert module with application_id
+    ---------------------------------------------------- */
     const result = await executeQuery(
-      `INSERT INTO modules (id, name, description, manager_id) 
-       VALUES (modules_seq.NEXTVAL, :name, :description, :managerId) 
-       RETURNING id, name, description, manager_id INTO :outId, :outName, :outDesc, :outMgr`,
+      `
+      INSERT INTO modules (
+        id,
+        name,
+        description,
+        manager_id,
+        application_id
+      )
+      VALUES (
+        modules_seq.NEXTVAL,
+        :name,
+        :description,
+        :managerId,
+        :applicationId
+      )
+      RETURNING
+        id,
+        name,
+        description,
+        manager_id,
+        application_id
+      INTO
+        :outId,
+        :outName,
+        :outDesc,
+        :outMgr,
+        :outApp
+      `,
       {
         name,
         description,
         managerId,
+        applicationId,
         outId: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
         outName: { dir: oracledb.BIND_OUT, type: oracledb.STRING },
         outDesc: { dir: oracledb.BIND_OUT, type: oracledb.STRING },
         outMgr: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
+        outApp: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
       }
     );
 
+    /* ----------------------------------------------------
+       3️⃣ Response
+    ---------------------------------------------------- */
     res.status(201).json({
       id: result.outBinds.outId,
       name: result.outBinds.outName,
       description: result.outBinds.outDesc,
       managerId: result.outBinds.outMgr,
+      applicationId: result.outBinds.outApp,
     });
   } catch (err) {
     console.error("Failed to create module:", err);
@@ -159,39 +112,89 @@ exports.createModule = async (req, res) => {
   }
 };
 
-// -----------------------------
 // Get all Modules for manager/admin
 exports.getModules = async (req, res) => {
   try {
-    const managerId = req.user.role === "manager" ? req.user.id : req.user.managerId;
-    if (!managerId) return res.status(400).json({ error: "Manager ID not found" });
+    const user = req.user;
 
-    // Fetch modules with project count
-    const modulesResult = await executeQuery(
-      `SELECT 
-          m.id,
-          m.name,
-          m.description,
-          m.manager_id,
-          COUNT(p.id) AS project_count
-       FROM modules m
-       LEFT JOIN projects p ON p.module_id = m.id
-       WHERE m.manager_id = :managerId
-       GROUP BY m.id, m.name, m.description, m.manager_id
-       ORDER BY m.name`,
-      { managerId },
-        { outFormat: oracledb.OUT_FORMAT_OBJECT } // <-- this is important
+    // 🔹 Build employee visibility condition
+    const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
 
-    );
-    // Map result to frontend-friendly structure
-    const modules = modulesResult.rows.map(row => ({
+    // 🎯 Optional application filter
+    const { applicationId } = req.query;
+    let appFilter = "";
+
+    if (applicationId) {
+      appFilter = "AND m.application_id = :applicationId";
+      binds.applicationId = Number(applicationId);
+    }
+let visibilityWhere = "";
+let finalBinds = {};
+
+if (req.user.role === "admin" || req.user.role ==="employee") {
+  // TL → show modules of his manager
+  visibilityWhere = `
+    m.manager_id = (
+      SELECT manager_id
+      FROM employees
+      WHERE id = :currentUserId
+    )
+  `;
+
+  finalBinds.currentUserId = req.user.id;
+
+} else {
+  // Normal hierarchy visibility
+  visibilityWhere = `
+    m.manager_id IN (
+      SELECT e.id
+      FROM employees e
+      WHERE 1=1
+      ${sqlCondition}
+    )
+  `;
+
+  finalBinds = { ...binds }; // use only oracle visibility binds
+}
+    const query = `
+  SELECT
+    m.id,
+    m.name,
+    m.description,
+    m.manager_id,
+    m.application_id,
+    a.name AS application_name,
+    COUNT(p.id) AS project_count
+  FROM modules m
+  JOIN applications a
+    ON a.id = m.application_id
+  LEFT JOIN projects p
+    ON p.module_id = m.id
+  WHERE ${visibilityWhere}
+  ${appFilter}
+  GROUP BY
+    m.id,
+    m.name,
+    m.description,
+    m.manager_id,
+    m.application_id,
+    a.name
+  ORDER BY m.name
+`;
+
+    const result = await executeQuery(query, finalBinds, {
+      outFormat: oracledb.OUT_FORMAT_OBJECT,
+    });
+
+    const modules = result.rows.map(row => ({
       id: row.ID,
       name: row.NAME,
       description: row.DESCRIPTION,
       managerId: row.MANAGER_ID,
-      projects: Number(row.PROJECT_COUNT) // for frontend mapping (length = project count)
+      applicationId: row.APPLICATION_ID,
+      applicationName: row.APPLICATION_NAME,
+      projects: Number(row.PROJECT_COUNT),
     }));
-    
     res.json(modules);
   } catch (err) {
     console.error("Failed to fetch modules:", err);
@@ -199,25 +202,45 @@ exports.getModules = async (req, res) => {
   }
 };
 
-
-// -----------------------------
 // Get single Module by ID
 exports.getModuleById = async (req, res) => {
   try {
-    const managerId = req.user.role === "manager" ? req.user.id : req.user.managerId;
+    const user = req.user;
     const { id } = req.params;
 
-    const result = await executeQuery(
-      `SELECT id, name, description, manager_id FROM modules WHERE id = :id AND manager_id = :managerId`,
-      { id: Number(id), managerId }
-    );
+    const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
 
-    if (result.rows.length === 0) {
+    binds.moduleId = Number(id);
+
+    const query = `
+      SELECT m.id, m.name, m.description, m.manager_id, m.application_id
+      FROM modules m
+      WHERE m.id = :moduleId
+      AND m.manager_id IN (
+        SELECT e.id
+        FROM employees e
+        WHERE 1=1
+        ${sqlCondition}
+      )
+    `;
+
+    const result = await executeQuery(query, binds, {
+      outFormat: oracledb.OUT_FORMAT_OBJECT,
+    });
+
+    if (!result.rows.length) {
       return res.status(404).json({ error: "Module not found or access denied" });
     }
 
     const row = result.rows[0];
-    res.json({ id: row[0], name: row[1], description: row[2], managerId: row[3] });
+
+    res.json({
+      id: row.ID,
+      name: row.NAME,
+      description: row.DESCRIPTION,
+      managerId: row.MANAGER_ID,
+      applicationId: row.APPLICATION_ID,
+    });
   } catch (err) {
     console.error("Failed to fetch module:", err);
     res.status(500).json({ error: err.message });
@@ -228,36 +251,131 @@ exports.getModuleById = async (req, res) => {
 // Update Module
 exports.updateModule = async (req, res) => {
   try {
-    const managerId = req.user.role === "manager" ? req.user.id : req.user.managerId;
+    const user = req.user;
     const { id } = req.params;
-    const { name, description } = req.body;
+    const { name, description, applicationId } = req.body;
 
-    const result = await executeQuery(
-      `UPDATE modules SET name = :name, description = :description 
-       WHERE id = :id AND manager_id = :managerId 
-       RETURNING id, name, description, manager_id INTO :outId, :outName, :outDesc, :outMgr`,
-      {
-        id: Number(id),
-        managerId,
-        name,
-        description,
-        outId: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
-        outName: { dir: oracledb.BIND_OUT, type: oracledb.STRING },
-        outDesc: { dir: oracledb.BIND_OUT, type: oracledb.STRING },
-        outMgr: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
-      }
+    // 🔹 Basic validation
+    if (!name) {
+      return res.status(400).json({ error: "Module name is required" });
+    }
+
+    const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
+
+    binds.moduleId = Number(id);
+
+    /* ---------------------------------------------------------
+       1️⃣ Check module visibility + get manager_id
+    --------------------------------------------------------- */
+    const existing = await executeQuery(
+      `
+      SELECT m.manager_id, m.application_id
+      FROM modules m
+      WHERE m.id = :moduleId
+      AND m.manager_id IN (
+        SELECT e.id
+        FROM employees e
+        WHERE 1=1
+        ${sqlCondition}
+      )
+      `,
+      binds,
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
 
-    if (!result.outBinds || !result.outBinds.outId) {
-      return res.status(404).json({ error: "Module not found or access denied" });
+    if (!existing.rows.length) {
+      return res.status(404).json({
+        error: "Module not found or access denied",
+      });
     }
+
+    const managerId = existing.rows[0].MANAGER_ID;
+    const currentAppId = existing.rows[0].APPLICATION_ID;
+
+    /* ---------------------------------------------------------
+       2️⃣ Validate new application (if changing)
+    --------------------------------------------------------- */
+    let newApplicationId = currentAppId;
+
+    if (
+      applicationId &&
+      applicationId !== "all" &&
+      Number(applicationId) !== currentAppId
+    ) {
+      const validation = await executeQuery(
+        `
+        SELECT 1
+        FROM employee_applications
+        WHERE employee_id = :managerId
+          AND application_id = :applicationId
+        `,
+        {
+          managerId,
+          applicationId: Number(applicationId),
+        }
+      );
+
+      if (!validation.rows.length) {
+        return res.status(403).json({
+          error: "Manager is not mapped to the selected application",
+        });
+      }
+
+      newApplicationId = Number(applicationId);
+    }
+
+    /* ---------------------------------------------------------
+       3️⃣ Build dynamic SET clause safely
+    --------------------------------------------------------- */
+    const updateBinds = {
+      moduleId: Number(id),
+      name,
+      description,
+      outId: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
+      outName: { dir: oracledb.BIND_OUT, type: oracledb.STRING },
+      outDesc: { dir: oracledb.BIND_OUT, type: oracledb.STRING },
+      outMgr: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
+      outApp: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
+    };
+
+    let setClause = `
+      m.name = :name,
+      m.description = :description
+    `;
+
+    if (newApplicationId !== currentAppId) {
+      setClause += `, m.application_id = :applicationId`;
+      updateBinds.applicationId = newApplicationId;
+    }
+
+    const updateQuery = `
+      UPDATE modules m
+      SET ${setClause}
+      WHERE m.id = :moduleId
+      RETURNING
+        m.id,
+        m.name,
+        m.description,
+        m.manager_id,
+        m.application_id
+      INTO
+        :outId,
+        :outName,
+        :outDesc,
+        :outMgr,
+        :outApp
+    `;
+
+    const result = await executeQuery(updateQuery, updateBinds);
 
     res.json({
       id: result.outBinds.outId,
       name: result.outBinds.outName,
       description: result.outBinds.outDesc,
       managerId: result.outBinds.outMgr,
+      applicationId: result.outBinds.outApp,
     });
+
   } catch (err) {
     console.error("Failed to update module:", err);
     res.status(500).json({ error: err.message });
@@ -268,24 +386,38 @@ exports.updateModule = async (req, res) => {
 // Delete Module
 exports.deleteModule = async (req, res) => {
   try {
-    const managerId = req.user.role === "manager" ? req.user.id : req.user.managerId;
+    const user = req.user;
     const { id } = req.params;
 
-    const result = await executeQuery(
-      `DELETE FROM modules WHERE id = :id AND manager_id = :managerId RETURNING id INTO :outId`,
-      {
-        id: Number(id),
-        managerId,
-        outId: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
-      }
-    );
+    const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
+
+    binds.moduleId = Number(id);
+
+    const query = `
+      DELETE FROM modules m
+      WHERE m.id = :moduleId
+      AND m.manager_id IN (
+        SELECT e.id
+        FROM employees e
+        WHERE 1=1
+        ${sqlCondition}
+      )
+      RETURNING m.id INTO :outId
+    `;
+
+    binds.outId = { dir: oracledb.BIND_OUT, type: oracledb.NUMBER };
+
+    const result = await executeQuery(query, binds);
 
     if (!result.outBinds || !result.outBinds.outId) {
       return res.status(404).json({ error: "Module not found or access denied" });
     }
 
-    // Delete related projects
-    await executeQuery(`DELETE FROM projects WHERE module_id = :moduleId`, { moduleId: Number(id) });
+    // Delete related projects safely
+    await executeQuery(
+      `DELETE FROM projects WHERE module_id = :moduleId`,
+      { moduleId: Number(id) }
+    );
 
     res.json({ message: "Module deleted successfully" });
   } catch (err) {
