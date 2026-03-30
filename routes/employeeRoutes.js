@@ -69,6 +69,7 @@ router.post(
         vendorName,
         category,
         applicationName,
+        applicationId,
         dateOfJoining,
         lastWorkingDay,
         teamMemberStatus = "live",
@@ -162,7 +163,21 @@ if (creator.role === "manager" && Number(reportingManager) === creator.id) {
   }
 }
 
+// -------------------------------------------------------
+// 🔹 Convert applicationId → applicationName
+// -------------------------------------------------------
+let finalApplicationName = applicationName;
+if (Number(applicationName) && applicationId !== "all") {
+  const appRes = await conn.execute(
+    `SELECT name FROM applications WHERE id = :id`,
+    { id: Number(applicationName) },
+    { outFormat: oracledb.OUT_FORMAT_OBJECT }
+  );
 
+  if (appRes.rows.length > 0) {
+    finalApplicationName = appRes.rows[0].NAME;
+  }
+}
       // -------------------------------------------------------
       // 5️⃣ Insert employee
       // -------------------------------------------------------
@@ -198,7 +213,7 @@ if (creator.role === "manager" && Number(reportingManager) === creator.id) {
           rm: reportingManager || null,
           vendor: vendorName,
           cat: category,
-          app: applicationName,
+          app: finalApplicationName,
           doj: dateOfJoining,
           lwd: lastWorkingDay,
           status: teamMemberStatus,
@@ -279,13 +294,46 @@ router.get(
         const employeesRaw = result.rows;
 
         // -------------------------------------------------------
+// 🔹 APPLICATION ID → NAME mapping
+// -------------------------------------------------------
+const applicationIds = [
+  ...new Set(
+    employeesRaw.map((emp) => emp.APPLICATION_ID).filter(Boolean)
+  ),
+];
+let applicationMap = {};
+
+if (applicationIds.length > 0) {
+  const appSql = `
+    SELECT id, name
+    FROM applications
+    WHERE id IN (${applicationIds.map((_, i) => `:app${i}`).join(",")})
+  `;
+
+  const appBinds = {};
+  applicationIds.forEach((id, idx) => {
+    appBinds[`app${idx}`] = id;
+  });
+
+  const appResult = await conn.execute(appSql, appBinds, {
+    outFormat: oracledb.OUT_FORMAT_OBJECT,
+  });
+
+  appResult.rows.forEach((app) => {
+    applicationMap[app.ID] = app.NAME;
+  });
+}
+
+        // -------------------------------------------------------
         // 3️⃣ Collect reporting_manager values to resolve names
         // -------------------------------------------------------
-        const reportingManagerIds = [
-          ...new Set(
-            employeesRaw.map((emp) => emp.REPORTING_MANAGER).filter(Boolean)
-          ),
-        ];
+const reportingManagerIds = [
+  ...new Set(
+    employeesRaw
+      .map((emp) => Number(emp.REPORTING_MANAGER))
+      .filter((id) => !!id)
+  ),
+];
 
         let reportingManagerMap = {};
         if (reportingManagerIds.length > 0) {
@@ -341,12 +389,19 @@ router.get(
             role: ROLE,
             location: LOCATION,
             category: CATEGORY,
-            applicationName: APPLICATION_NAME,
-            reportingManager:
-              reportingManagerMap[REPORTING_MANAGER] || {
-                id: REPORTING_MANAGER || null,
-                name: "-",
-              },
+            applicationId: emp.APPLICATION_ID || null,
+
+applicationName:
+  APPLICATION_NAME ||
+  applicationMap[emp.APPLICATION_ID] ||
+  "-",
+
+reportingManager: REPORTING_MANAGER
+  ? reportingManagerMap[REPORTING_MANAGER] || {
+      id: REPORTING_MANAGER,
+      name: "Unknown",
+    }
+  : null,
             grade: GRADE,
             skills: SKILLS ? JSON.parse(SKILLS || "[]") : [],
             dateOfJoining: DATE_OF_JOINING
@@ -606,31 +661,34 @@ router.put(
       }
 
       // -----------------------------------------------------------
-      // 6️⃣ Validate reportingManager using visibility oracle
-      // -----------------------------------------------------------
-      if (body.reportingManager) {
-        const { sqlCondition: rmCond, binds: rmBinds } =
-          buildVisibilityOracle(creator, {});
+// 6️⃣ Validate reportingManager ONLY if changed
+// -----------------------------------------------------------
+if (
+  body.reportingManager !== undefined &&
+  body.reportingManager !== employee.REPORTING_MANAGER
+) {
+  const { sqlCondition: rmCond, binds: rmBinds } =
+    buildVisibilityOracle(creator, {});
 
-        rmBinds.rmId = body.reportingManager;
+  rmBinds.rmId = body.reportingManager;
 
-        const rmSql = `
-          SELECT e.id
-          FROM employees e
-          WHERE id = :rmId
-          ${rmCond}
-        `;
+  const rmSql = `
+    SELECT e.id
+    FROM employees e
+    WHERE id = :rmId
+    ${rmCond}
+  `;
 
-        const rmRes = await conn.execute(rmSql, rmBinds, {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        });
+  const rmRes = await conn.execute(rmSql, rmBinds, {
+    outFormat: oracledb.OUT_FORMAT_OBJECT,
+  });
 
-        if (rmRes.rows.length === 0) {
-          return res.status(403).json({
-            error: "You are not authorized to assign this reporting manager",
-          });
-        }
-      }
+  if (rmRes.rows.length === 0) {
+    return res.status(403).json({
+      error: "You are not authorized to assign this reporting manager",
+    });
+  }
+}
 
       // -----------------------------------------------------------
       // 7️⃣ Build UPDATE Query Dynamically
@@ -668,100 +726,156 @@ router.put(
 );
 
 // GET /employees/reporting-managers
-router.get("/reporting-managers", authMiddleware(["admin", "manager"]), async (req, res) => {
-  try {
-    const creator = req.user; // { id, role, managerId }
-    let managers = [];
+// router.get("/reporting-managers", authMiddleware(["head_lt", "lt", "alt", "admin", "manager","employee"]), async (req, res) => {
+//   try {
+//     const creator = req.user; // { id, role, managerId }
+//     let managers = [];
 
-    if (creator.role === "manager") {
-      // Manager → self + their sub-managers
-      const selfResult = await executeQuery(
-        `SELECT id, employee_id, name, role 
-         FROM employees 
-         WHERE id = :id`,
-        [creator.id],
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
-      );
+//     if (creator.role === "manager") {
+//       // Manager → self + their sub-managers
+//       const selfResult = await executeQuery(
+//         `SELECT id, employee_id, name, role 
+//          FROM employees 
+//          WHERE id = :id`,
+//         [creator.id],
+//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
+//       );
 
-      const subResult = await executeQuery(
-        `SELECT id, employee_id, name, role 
-         FROM employees 
-         WHERE role IN ('admin','manager') AND manager_id = :id`,
-        [creator.id],
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
-      );
+//       const subResult = await executeQuery(
+//         `SELECT id, employee_id, name, role 
+//          FROM employees 
+//          WHERE role IN ('admin','manager') AND manager_id = :id`,
+//         [creator.id],
+//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
+//       );
 
-      const selfManager = selfResult.rows?.[0] || null;
-      const subManagers = subResult.rows || [];
+//       const selfManager = selfResult.rows?.[0] || null;
+//       const subManagers = subResult.rows || [];
 
-      managers = [
-        ...(selfManager ? [selfManager] : []),
-        ...subManagers
-      ];
+//       managers = [
+//         ...(selfManager ? [selfManager] : []),
+//         ...subManagers
+//       ];
 
-    } else if (creator.role === "admin") {
-      if (!creator.managerId) {
-        return res.status(400).json({ error: "Admin is not linked to a manager" });
-      }
+//     } else if (creator.role === "admin") {
+//       if (!creator.managerId) {
+//         return res.status(400).json({ error: "Admin is not linked to a manager" });
+//       }
 
-      // Admin → self + linked manager + sub-managers under that manager
-      const selfResult = await executeQuery(
-        `SELECT id, employee_id, name, role 
-         FROM employees 
-         WHERE id = :id`,
-        [creator.id],
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
-      );
+//       // Admin → self + linked manager + sub-managers under that manager
+//       const selfResult = await executeQuery(
+//         `SELECT id, employee_id, name, role 
+//          FROM employees 
+//          WHERE id = :id`,
+//         [creator.id],
+//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
+//       );
 
-      const linkedResult = await executeQuery(
-        `SELECT id, employee_id, name, role 
-         FROM employees 
-         WHERE id = :mid`,
-        [creator.managerId],
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
-      );
+//       const linkedResult = await executeQuery(
+//         `SELECT id, employee_id, name, role 
+//          FROM employees 
+//          WHERE id = :mid`,
+//         [creator.managerId],
+//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
+//       );
 
-      const subResult = await executeQuery(
-        `SELECT id, employee_id, name, role 
-         FROM employees 
-         WHERE role IN ('admin','manager') AND manager_id = :mid AND id != :aid`,
-        [creator.managerId, creator.id],
-        { outFormat: oracledb.OUT_FORMAT_OBJECT }
-      );
+//       const subResult = await executeQuery(
+//         `SELECT id, employee_id, name, role 
+//          FROM employees 
+//          WHERE role IN ('admin','manager') AND manager_id = :mid AND id != :aid`,
+//         [creator.managerId, creator.id],
+//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
+//       );
 
-      const selfAdmin = selfResult.rows?.[0] || null;
-      const linkedManager = linkedResult.rows?.[0] || null;
-      const subManagers = subResult.rows || [];
+//       const selfAdmin = selfResult.rows?.[0] || null;
+//       const linkedManager = linkedResult.rows?.[0] || null;
+//       const subManagers = subResult.rows || [];
 
-      managers = [
-        ...(selfAdmin ? [selfAdmin] : []),
-        ...(linkedManager ? [linkedManager] : []),
-        ...subManagers
-      ];
+//       managers = [
+//         ...(selfAdmin ? [selfAdmin] : []),
+//         ...(linkedManager ? [linkedManager] : []),
+//         ...subManagers
+//       ];
 
-    } else {
-      return res.status(403).json({ error: "Unauthorized" });
+//     } else {
+//       return res.status(403).json({ error: "Unauthorized" });
+//     }
+
+//     if (managers.length === 0) {
+//       return res.json([]); // return empty array if no managers
+//     }
+
+//     // Convert keys to lowercase
+//     const formattedManagers = managers.map(mgr => ({
+//       id: mgr.ID || mgr.id,
+//       employee_id: mgr.EMPLOYEE_ID || mgr.employee_id,
+//       name: mgr.NAME || mgr.name,
+//       role: mgr.ROLE || mgr.role
+//     }));
+
+//     res.json(formattedManagers);
+
+//   } catch (err) {
+//     console.error("Fetching reporting managers failed:", err);
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
+router.get(
+  "/reporting-managers",
+  authMiddleware(["head_lt", "lt", "alt", "admin", "manager", "employee"]),
+  async (req, res) => {
+    try {
+      const user = req.user;
+
+      let sql;
+      let binds = {};
+
+      if (user.role === "employee") {
+  sql = `
+    SELECT m.id, m.employee_id, m.name, m.role
+    FROM employees e
+    JOIN employees m ON m.id = e.reporting_manager
+    WHERE e.id = :empId
+  `;
+  binds.empId = user.id;
+
+} else {
+  sql = `
+    SELECT e.id, e.employee_id, e.name, e.role
+    FROM employees e
+    WHERE e.role IN ('head_lt', 'lt', 'alt', 'admin', 'manager')
+      AND (
+        e.id = :selfId
+        OR e.manager_id = :managerId
+      )
+    ORDER BY e.name
+  `;
+
+  binds = {
+    selfId: user.id,
+    managerId: user.id,
+  };
+}
+      const result = await executeQuery(sql, binds, {
+        outFormat: oracledb.OUT_FORMAT_OBJECT,
+      });
+
+      const managers = result.rows.map((mgr) => ({
+        id: mgr.ID,
+        employee_id: mgr.EMPLOYEE_ID,
+        name: mgr.NAME,
+        role: mgr.ROLE,
+      }));
+      res.json(managers);
+    } catch (err) {
+      console.error("Fetching reporting managers failed:", err);
+      res.status(500).json({ error: err.message });
     }
-
-    if (managers.length === 0) {
-      return res.json([]); // return empty array if no managers
-    }
-
-    // Convert keys to lowercase
-    const formattedManagers = managers.map(mgr => ({
-      id: mgr.ID || mgr.id,
-      employee_id: mgr.EMPLOYEE_ID || mgr.employee_id,
-      name: mgr.NAME || mgr.name,
-      role: mgr.ROLE || mgr.role
-    }));
-
-    res.json(formattedManagers);
-
-  } catch (err) {
-    console.error("Fetching reporting managers failed:", err);
-    res.status(500).json({ error: err.message });
   }
-});
+);
+
+
 
 // GET /employees/team-leads
 router.get("/team-leads", authMiddleware(["head_lt", "lt", "alt", "admin", "manager"]), async (req, res) => {
@@ -909,6 +1023,108 @@ router.get(
   }
 );
 
+
+//updated one 
+router.get(
+  "/applicationsnewold",
+  authMiddleware(["manager", "admin","alt","lt","head_lt"]), // admin = TL in your system
+  async (req, res) => {
+    return safeRoute(req, res, async (conn) => {
+      // 🔐 Resolve owning manager
+      const managerId =
+        req.user.role === "manager"
+          ? Number(req.user.id)
+          : Number(req.user.managerId);
+
+      if (!managerId) {
+        return res.status(400).json({ error: "Manager ID not found" });
+      }
+
+      // ✅ Phase-1 authoritative query
+      const result = await conn.execute(
+        `
+        SELECT a.id, a.name
+        FROM applications a
+        JOIN employee_applications ea
+          ON ea.application_id = a.id
+        WHERE ea.employee_id = :managerId
+        ORDER BY a.name
+        `,
+        { managerId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+      return res.json(result.rows || []);
+    });
+  }
+);
+
+
+//fully updated one
+
+router.get(
+  "/applicationsnew",
+  authMiddleware(["manager", "admin", "alt", "lt", "head_lt", "employee"]),
+  async (req, res) => {
+    return safeRoute(req, res, async (conn) => {
+      const user = req.user;
+      const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
+
+      let where = "";
+      let finalBinds = {};
+
+      /* ---------------------------------------------------------
+         1️⃣ TL Special Handling
+      --------------------------------------------------------- */
+
+      if (user.role === "admin") {
+        // TL → show applications of his manager
+        where = `
+          WHERE ea.employee_id = (
+            SELECT manager_id
+            FROM employees
+            WHERE id = :currentUserId
+          )
+        `;
+        finalBinds.currentUserId = user.id;
+
+      } else {
+        // Normal subtree visibility
+        where = `
+          WHERE e.id IN (
+            SELECT e.id
+            FROM employees e
+            WHERE 1=1
+            ${sqlCondition}
+          )
+        `;
+        finalBinds = { ...binds };
+      }
+
+      /* ---------------------------------------------------------
+         2️⃣ Query
+      --------------------------------------------------------- */
+
+      const query = `
+        SELECT DISTINCT a.id, a.name
+        FROM applications a
+        JOIN employee_applications ea
+          ON ea.application_id = a.id
+        JOIN employees e
+          ON e.id = ea.employee_id
+        ${where}
+        ORDER BY a.name
+      `;
+
+      const result = await conn.execute(query, finalBinds, {
+        outFormat: oracledb.OUT_FORMAT_OBJECT,
+      });
+
+      res.json(result.rows || []);
+    });
+  }
+);
+
+
 // ALT scoped
 router.get("/applications/alt", authMiddleware(["alt"]), async (req, res) => {
   return safeRoute(req, res, async (conn) => {
@@ -950,6 +1166,7 @@ router.get("/applications/all", authMiddleware(["head_lt"]), async (req, res) =>
     return res.json(apps);
   });
 });
+// Employee scoped
 router.get(
   "/applications/employee",
   authMiddleware(["employee"]),
@@ -976,7 +1193,7 @@ router.get(
     });
   }
 );
-
+//admin scoped
 router.get(
   "/applications/tl",
   authMiddleware(["admin"]),
