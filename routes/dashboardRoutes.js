@@ -732,7 +732,7 @@ router.get(
 
       const user = req.user;
       const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
-      const { applicationId, tlId } = req.query;
+      const { applicationId, tlId, zeroHours } = req.query; // 👈 added zeroHours
 
       let where = "";
       let finalBinds = { ...binds };
@@ -776,6 +776,7 @@ router.get(
       }
 
       finalBinds.today = new Date();
+      finalBinds.zeroHours = zeroHours === "true" ? 1 : 0; // 👈 added bind
 
       /* ---------------------------------------------------------
          3️⃣ Project Summary Query (UPDATED)
@@ -794,6 +795,8 @@ router.get(
           /* ---------------- TASKS ---------------- */
           COUNT(DISTINCT t.task_id) AS "taskCount",
           COUNT(DISTINCT t.e_id) AS "employeeCount",
+
+          SUM(NVL(t.workload_hours, 0)) AS "totalHours",
 
           SUM(
             CASE 
@@ -880,6 +883,8 @@ router.get(
           li.issueCount,
           li.completedIssues,
           li.openIssues
+
+        HAVING (:zeroHours = 0 OR NVL(SUM(t.workload_hours), 0) = 0)
 
         ORDER BY p.name
       `;
@@ -1272,10 +1277,10 @@ router.get(
       // 🔹 Optional month/year filter (based on due date)
       let monthFilter = "";
       if (month && year) {
-        monthFilter = `
-          EXTRACT(MONTH FROM t.due_date) = :month
-          AND EXTRACT(YEAR FROM t.due_date) = :year
-        `;
+       monthFilter = `
+  EXTRACT(MONTH FROM t.completed_at) = :month
+  AND EXTRACT(YEAR FROM t.completed_at) = :year
+`;
         binds.month = month;
         binds.year = year;
       }
