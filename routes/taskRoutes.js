@@ -851,6 +851,12 @@ router.get(
         AND t.DUE_DATE < :startDate
       )
       OR t.DUE_DATE BETWEEN :startDate AND :endDate
+	  OR t.TASK_ID IN (
+              SELECT DISTINCT tc.TASK_ID
+              FROM COMPONENT_WORKLOGS wl
+              JOIN TASK_COMPONENTS tc ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
+              WHERE wl.LOG_DATE BETWEEN :startDate AND :endDate
+            )
       OR (
      t.STATUS NOT IN ('Live', 'Preprod_Signoff', 'Completed')
     AND EXISTS (
@@ -1159,6 +1165,12 @@ router.get(
         AND t.DUE_DATE < :startDate
       )
       OR t.DUE_DATE BETWEEN :startDate AND :endDate
+	  OR t.TASK_ID IN (
+              SELECT DISTINCT tc.TASK_ID
+              FROM COMPONENT_WORKLOGS wl
+              JOIN TASK_COMPONENTS tc ON wl.TASK_COMPONENT_ID = tc.TASK_COMPONENT_ID
+              WHERE wl.LOG_DATE BETWEEN :startDate AND :endDate
+            )
       OR (
      t.STATUS NOT IN ('Live', 'Preprod_Signoff', 'Completed')
     AND EXISTS (
