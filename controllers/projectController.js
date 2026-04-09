@@ -338,6 +338,11 @@ if (filters.projectStage) {
   finalBinds.projectStage = filters.projectStage;
 }
 
+if (filters.onTrackStatus) {
+  where += ` AND p.on_track_status = :onTrackStatus`;
+  finalBinds.onTrackStatus = filters.onTrackStatus;
+}
+
 if (filters.startDateFrom) {
   where += ` AND p.start_date >= TO_DATE(:startDateFrom, 'YYYY-MM-DD')`;
   finalBinds.startDateFrom = filters.startDateFrom;
@@ -382,21 +387,26 @@ const result = await connection.execute(
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const computeOnTrackStatus = (plannedEnd) => {
-      if (!plannedEnd) return "On Track";
+const computeOnTrackStatus = (plannedEnd, projectStage, storedStatus) => {
+  // Preserve Delayed for completed projects
+  if (projectStage === "Live" && storedStatus === "Delayed") return "Delayed";
 
-      const planned = new Date(plannedEnd);
-      if (isNaN(planned.getTime())) return "On Track";
-
-      planned.setHours(0, 0, 0, 0);
-      return today > planned ? "Delayed" : "On Track";
-    };
+  if (!plannedEnd) return "On Track";
+  const planned = new Date(plannedEnd);
+  if (isNaN(planned.getTime())) return "On Track";
+  planned.setHours(0, 0, 0, 0);
+  return today > planned ? "Delayed" : "On Track";
+};
 
     const updatedProjects = [];
 
     for (let project of projects) {
       const storedStatus = project.onTrackStatus;
-      const computedStatus = computeOnTrackStatus(project.plannedEndDate);
+      const computedStatus = computeOnTrackStatus(
+  project.plannedEndDate,
+  project.projectStage,   // 👈
+  project.onTrackStatus   // 👈
+);
 
       // Always return real-time value
       project.onTrackStatus = computedStatus;
@@ -665,27 +675,37 @@ exports.updateProject = async (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const computeOnTrackStatus = (plannedEnd) => {
-      if (!plannedEnd) return "On Track";
-      const planned = new Date(plannedEnd);
-      planned.setHours(0, 0, 0, 0);
-      return today > planned ? "Delayed" : "On Track";
-    };
+const computeOnTrackStatus = (plannedEnd, projectStage, currentOnTrackStatus) => {
+  // Only preserve Delayed permanently if project is already Live
+  if (projectStage === "Live" && currentOnTrackStatus === "Delayed") return "Delayed";
+
+  // Active project — always recompute fresh from the date
+  if (!plannedEnd) return "On Track";
+  const planned = new Date(plannedEnd);
+  planned.setHours(0, 0, 0, 0);
+  return today > planned ? "Delayed" : "On Track";
+};
 
     const parseClobJson = async (clob) => {
-      if (!clob) return [];
-      try {
-        if (clob instanceof oracledb.Lob) {
-          let data = "";
-          clob.setEncoding("utf8");
-          for await (const chunk of clob) data += chunk;
-          return JSON.parse(data);
-        }
-        return JSON.parse(clob);
-      } catch {
-        return [];
-      }
-    };
+  if (!clob) return [];
+  try {
+    if (clob instanceof oracledb.Lob) {
+      let data = "";
+      clob.setEncoding("utf8");
+      for await (const chunk of clob) data += chunk;
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) return parsed;
+      if (typeof parsed === "object" && parsed !== null) return Object.values(parsed); // 👈 recover object data
+      return [];
+    }
+    const parsed = JSON.parse(clob);
+    if (Array.isArray(parsed)) return parsed;
+    if (typeof parsed === "object" && parsed !== null) return Object.values(parsed); // 👈 recover object data
+    return [];
+  } catch {
+    return [];
+  }
+};
 
     // --------------------------------------------------
     // Allowed fields
@@ -786,9 +806,12 @@ exports.updateProject = async (req, res) => {
     // --------------------------------------------------
     // Auto compute on_track_status
     // --------------------------------------------------
-    allowedFields.on_track_status = computeOnTrackStatus(
-      allowedFields.planned_end_date
-    );
+    // ✅ Correct call
+allowedFields.on_track_status = computeOnTrackStatus(
+  allowedFields.planned_end_date,
+  allowedFields.project_stage,
+  currentProject.ON_TRACK_STATUS
+);
 
     // --------------------------------------------------
     // PROJECT_CHANGES_RECEIVED (MERGE)
