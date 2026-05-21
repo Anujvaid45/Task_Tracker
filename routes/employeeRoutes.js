@@ -4,6 +4,7 @@ const authMiddleware = require('../middleware/auth.js');
 const bcrypt = require('bcryptjs');
 const { safeRoute } = require("../utils/dbWrapper"); // uses conn = pooled connection and closes it
 const { buildVisibilityOracle } = require("../utils/visibilityOracle");
+const {resolveHierarchyChain} = require("../utils/hierarchyResolver.js");
 
 const router = express.Router(); 
 
@@ -90,14 +91,8 @@ router.post(
       // -------------------------------------------------------
       // 2️⃣ Duplicate check
       // -------------------------------------------------------
-      const dupSql = `
-        SELECT employee_id, email 
-        FROM employees 
-        WHERE employee_id = :eid OR email = :em
-      `;
-
       const dupRes = await conn.execute(
-        dupSql,
+        `SELECT employee_id, email FROM employees WHERE employee_id = :eid OR email = :em`,
         { eid: employeeId, em: email },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
       );
@@ -111,94 +106,125 @@ router.post(
       }
 
       // -------------------------------------------------------
-      // 3️⃣ Core manager assignment logic EXACTLY as before
+      // 3️⃣ Manager assignment (same as before)
       // -------------------------------------------------------
       let managerIdToAssign = null;
 
       if (creator.role === "manager") {
         managerIdToAssign = creator.id;
-
       } else if (creator.role === "admin") {
         if (role !== "employee")
           return res.status(403).json({ error: "Admins can only create employees" });
 
         if (!creator.managerId)
-          return res
-            .status(400)
-            .json({ error: "Admin is not linked to a manager" });
+          return res.status(400).json({ error: "Admin not linked to manager" });
 
         managerIdToAssign = creator.managerId;
-
       } else {
-        // head_lt, lt, alt cannot directly create employees
         return res.status(403).json({ error: "Unauthorized to create users" });
       }
 
       // -------------------------------------------------------
-      // 4️⃣ Verify reportingManager belongs to creator's visibility tree
+      // 4️⃣ Visibility check
       // -------------------------------------------------------
-      // 💥 Skip visibility check if manager is assigning themselves
-if (creator.role === "manager" && Number(reportingManager) === creator.id) {
-  // allowed
-} else {
-  // ⚡ visibility check ONLY when reportingManager is someone else
-  const { sqlCondition, binds } = buildVisibilityOracle(creator, {});
-  binds.rid = reportingManager;
+      if (!(creator.role === "manager" && Number(reportingManager) === creator.id)) {
+        const { sqlCondition, binds } = buildVisibilityOracle(creator, {});
+        binds.rid = reportingManager;
 
-  const visSql = `
-    SELECT e.id
-    FROM employees e
-    WHERE e.id = :rid
-    ${sqlCondition}
-  `;
+        const visRes = await conn.execute(
+          `SELECT e.id FROM employees e WHERE e.id = :rid ${sqlCondition}`,
+          binds,
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
 
-  const visRes = await conn.execute(visSql, binds, {
-    outFormat: oracledb.OUT_FORMAT_OBJECT,
-  });
+        if (visRes.rows.length === 0) {
+          return res.status(403).json({
+            error: "You are not authorized to assign this reporting manager",
+          });
+        }
+      }
 
-  if (visRes.rows.length === 0) {
-    return res.status(403).json({
-      error: "You are not authorized to assign this reporting manager",
-    });
-  }
-}
-
+      // -------------------------------------------------------
+// 🔥 5️⃣ HANDLE MULTIPLE APPLICATIONS (FIXED)
 // -------------------------------------------------------
-// 🔹 Convert applicationId → applicationName
-// -------------------------------------------------------
-let finalApplicationName = applicationName;
-if (Number(applicationName) && applicationId !== "all") {
-  const appRes = await conn.execute(
-    `SELECT name FROM applications WHERE id = :id`,
-    { id: Number(applicationName) },
-    { outFormat: oracledb.OUT_FORMAT_OBJECT }
-  );
+let applicationIds = [];
 
-  if (appRes.rows.length > 0) {
-    finalApplicationName = appRes.rows[0].NAME;
+console.log(
+  "Received applicationName:",
+  applicationName,
+  "Received applicationId:",
+  applicationId
+);
+
+if (applicationName || applicationId) {
+  // applicationName contains IDs (comma-separated)
+  const idsFromName = applicationName
+    ? applicationName
+        .split(",")
+        .map((id) => id.trim())
+        .filter(Boolean)
+        .map(Number)
+        .filter((id) => !isNaN(id))
+    : [];
+
+  applicationIds.push(...idsFromName);
+
+  // also support single dropdown
+  if (applicationId && applicationId !== "all") {
+    const singleId = Number(applicationId);
+    if (!isNaN(singleId)) {
+      applicationIds.push(singleId);
+    }
   }
+
+  // remove duplicates
+  applicationIds = [...new Set(applicationIds)];
 }
       // -------------------------------------------------------
-      // 5️⃣ Insert employee
+      // 6️⃣ Insert employee
       // -------------------------------------------------------
       const hashedPassword = await bcrypt.hash(password, 10);
 
-      const insertSql = `
-        INSERT INTO employees 
-          (employee_id, name, email, phone, password, role, designation, skills,
-           manager_id, location, reporting_manager, vendor_name, category,
-           application_name, date_of_joining, last_working_day, team_member_status,
-           remarks, feedback, grade)
-        VALUES 
-          (:eid, :name, :email, :phone, :pass, :role, :des, :skills,
-           :mgr, :loc, :rm, :vendor, :cat, :app,
-           TO_DATE(:doj, 'YYYY-MM-DD'),
-           TO_DATE(:lwd, 'YYYY-MM-DD'),
-           :status, :remarks, :feedback, :grade)
-      `;
+// Convert application IDs → names
+let normalizedApplicationName = null;
+
+if (applicationName) {
+  const appIds = applicationName
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .map(Number)
+    .filter((id) => !isNaN(id));
+
+  if (appIds.length > 0) {
+    const result = await conn.execute(
+      `SELECT name FROM applications WHERE id IN (${appIds.map((_, i) => `:id${i}`).join(",")})`,
+      Object.fromEntries(appIds.map((id, i) => [`id${i}`, id])),
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+    );
+
+    const names = result.rows.map((row) => row.NAME);
+
+    normalizedApplicationName = names.join(",");
+  }
+}
 
       await conn.execute(
-        insertSql,
+        `
+        INSERT INTO employees (
+          employee_id, name, email, phone, password, role, designation, skills,
+          manager_id, location, reporting_manager, vendor_name, category,
+          application_name, date_of_joining, last_working_day,
+          team_member_status, remarks, feedback, grade
+        )
+        VALUES (
+          :eid, :name, :email, :phone, :pass, :role, :des, :skills,
+          :mgr, :loc, :rm, :vendor, :cat, :app,
+          TO_DATE(:doj, 'YYYY-MM-DD'),
+          TO_DATE(:lwd, 'YYYY-MM-DD'),
+          :status, :remarks, :feedback, :grade
+        )
+        `,
         {
           eid: employeeId,
           name,
@@ -213,20 +239,49 @@ if (Number(applicationName) && applicationId !== "all") {
           rm: reportingManager || null,
           vendor: vendorName,
           cat: category,
-          app: finalApplicationName,
+          app: normalizedApplicationName,
           doj: dateOfJoining,
           lwd: lastWorkingDay,
           status: teamMemberStatus,
           remarks,
           feedback,
           grade,
-        },
-        { autoCommit: true }
+        }
       );
 
       // -------------------------------------------------------
-      // 6️⃣ Response
+      // 7️⃣ Get employee PK
       // -------------------------------------------------------
+      const empRes = await conn.execute(
+        `SELECT id FROM employees WHERE employee_id = :eid`,
+        { eid: employeeId },
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
+
+      const empId = empRes.rows[0].ID;
+
+      // -------------------------------------------------------
+      // 🔥 8️⃣ Insert mapping
+      // -------------------------------------------------------
+      for (const appId of applicationIds) {
+        await conn.execute(
+          `
+          INSERT INTO employee_applications (employee_id, application_id)
+          SELECT :empId, :appId FROM dual
+          WHERE NOT EXISTS (
+            SELECT 1 FROM employee_applications
+            WHERE employee_id = :empId AND application_id = :appId
+          )
+          `,
+          { empId, appId }
+        );
+      }
+
+      // -------------------------------------------------------
+      // 9️⃣ Commit
+      // -------------------------------------------------------
+      await conn.commit();
+
       return res.json({
         employeeId,
         name,
@@ -376,6 +431,7 @@ const reportingManagerIds = [
             GRADE,
             SKILLS,
             DATE_OF_JOINING,
+            TEAM_MEMBER_STATUS,
             LAST_WORKING_DAY,
             ...rest
           } = emp;
@@ -407,6 +463,7 @@ reportingManager: REPORTING_MANAGER
             dateOfJoining: DATE_OF_JOINING
               ? formatDateForDisplay(DATE_OF_JOINING)
               : "-",
+              teamMemberStatus:TEAM_MEMBER_STATUS || "-",
             lastWorkingDay: LAST_WORKING_DAY
               ? formatDateForDisplay(LAST_WORKING_DAY)
               : "-",
@@ -433,98 +490,114 @@ router.delete(
       const { id } = req.params;
       const user = req.user;
 
-      // -------------------------------------------------------
-      // 1️⃣ Fetch employee being deleted
-      // -------------------------------------------------------
-      const empSql = `
-        SELECT *
-        FROM employees
-        WHERE id = :id
-      `;
-      const empRes = await conn.execute(empSql, { id }, { outFormat: oracledb.OUT_FORMAT_OBJECT });
+      try {
+        // -------------------------------------------------------
+        // 1️⃣ Fetch employee
+        // -------------------------------------------------------
+        const empRes = await conn.execute(
+          `SELECT * FROM employees WHERE id = :id`,
+          { id },
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
 
-      if (empRes.rows.length === 0) {
-        return res.status(404).json({ error: "Employee not found" });
-      }
+        if (empRes.rows.length === 0) {
+          return res.status(404).json({ error: "Employee not found" });
+        }
 
-      const employee = empRes.rows[0];
+        const employee = empRes.rows[0];
 
-      // -------------------------------------------------------
-      // 2️⃣ Visibility-based security check
-      //    (except special cases below)
-      // -------------------------------------------------------
-      const { sqlCondition, binds } = buildVisibilityOracle(user, {});
-      binds.targetId = id;
+        // -------------------------------------------------------
+        // 2️⃣ Visibility check
+        // -------------------------------------------------------
+        const { sqlCondition, binds } = buildVisibilityOracle(user, {});
+        binds.targetId = id;
 
-      const visSql = `
-        SELECT id 
-        FROM employees e
-        WHERE e.id = :targetId
-        ${sqlCondition}
-      `;
+        const visRes = await conn.execute(
+          `
+          SELECT id FROM employees e
+          WHERE e.id = :targetId
+          ${sqlCondition}
+          `,
+          binds,
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
 
-      const visRes = await conn.execute(visSql, binds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
-
-      if (visRes.rows.length === 0) {
-        return res.status(403).json({
-          error: "You are not authorized to delete this employee",
-        });
-      }
-
-      // -------------------------------------------------------
-      // 3️⃣ Special mandatory authorization rules
-      // -------------------------------------------------------
-
-      // ADMIN → may delete ONLY employees owned by their manager
-      if (user.role === "admin") {
-        if (employee.MANAGER_ID !== user.managerId) {
+        if (visRes.rows.length === 0) {
           return res.status(403).json({
-            error: "Admins can only delete employees under their manager",
+            error: "You are not authorized to delete this employee",
           });
         }
-      }
 
-      // MANAGER → strict rules
-      if (user.role === "manager") {
-        // Manager may delete admin or employee — ONLY if manager_id matches
-        if (["admin", "employee"].includes(employee.ROLE)) {
-          if (employee.MANAGER_ID !== user.id) {
+        // -------------------------------------------------------
+        // 3️⃣ Role rules
+        // -------------------------------------------------------
+        if (user.role === "admin") {
+          if (employee.MANAGER_ID !== user.managerId) {
             return res.status(403).json({
-              error: `Cannot delete this ${employee.ROLE}`,
+              error: "Admins can only delete employees under their manager",
             });
           }
-        } else {
-          // Manager may NOT delete LT, ALT, head_lt, manager
-          return res.status(403).json({ error: "Unauthorized to delete this user" });
         }
+
+        if (user.role === "manager") {
+          if (["admin", "employee"].includes(employee.ROLE)) {
+            if (employee.MANAGER_ID !== user.id) {
+              return res.status(403).json({
+                error: `Cannot delete this ${employee.ROLE}`,
+              });
+            }
+          } else {
+            return res.status(403).json({
+              error: "Unauthorized to delete this user",
+            });
+          }
+        }
+
+        // -------------------------------------------------------
+        // 🔥 4️⃣ DELETE MAPPINGS FIRST (IMPORTANT)
+        // -------------------------------------------------------
+        await conn.execute(
+          `DELETE FROM employee_applications WHERE employee_id = :id`,
+          { id }
+        );
+
+        // -------------------------------------------------------
+        // 🔹 5️⃣ Clean reporting references
+        // -------------------------------------------------------
+        await conn.execute(
+          `UPDATE employees SET reporting_manager = NULL WHERE reporting_manager = :id`,
+          { id }
+        );
+
+        // -------------------------------------------------------
+        // 🔹 6️⃣ Delete employee
+        // -------------------------------------------------------
+        await conn.execute(
+          `DELETE FROM employees WHERE id = :id`,
+          { id }
+        );
+
+        // -------------------------------------------------------
+        // 🔹 7️⃣ Commit
+        // -------------------------------------------------------
+        await conn.commit();
+
+        return res.json({ message: "Employee deleted successfully" });
+
+      } catch (err) {
+        console.error("Delete error:", err);
+
+        try {
+          await conn.rollback();
+        } catch (e) {}
+
+        return res.status(500).json({ error: err.message });
       }
-
-      // -------------------------------------------------------
-      // 4️⃣ Clean up subordinate references
-      // -------------------------------------------------------
-      await conn.execute(
-        `UPDATE employees SET reporting_manager = NULL WHERE reporting_manager = :id`,
-        { id },
-        { autoCommit: true }
-      );
-
-      // -------------------------------------------------------
-      // 5️⃣ Delete employee
-      // -------------------------------------------------------
-      await conn.execute(
-        `DELETE FROM employees WHERE id = :id`,
-        { id },
-        { autoCommit: true }
-      );
-
-      return res.json({ message: "Employee deleted successfully" });
     });
   }
 );
 
-// UPDATE Employee
+//EMPLOYEE UPDATE
 router.put(
   "/:id",
   authMiddleware(["head_lt", "lt", "alt", "admin", "manager", "employee"]),
@@ -560,7 +633,7 @@ router.put(
       };
 
       // -----------------------------------------------------------
-      // 1️⃣ Fetch employee being updated
+      // 1️⃣ Fetch employee
       // -----------------------------------------------------------
       const empResult = await conn.execute(
         `SELECT * FROM employees WHERE id = :id`,
@@ -574,20 +647,17 @@ router.put(
       const employee = empResult.rows[0];
 
       // -----------------------------------------------------------
-      // 2️⃣ EMPLOYEE ROLE SPECIAL CASE
+      // 2️⃣ Employee role restriction
       // -----------------------------------------------------------
       if (creator.role === "employee") {
         if (creator.id !== Number(id)) {
-          return res
-            .status(403)
-            .json({ error: "Unauthorized to update other employees" });
+          return res.status(403).json({ error: "Unauthorized" });
         }
 
-        // Employees can update ONLY skills
         if (!("skills" in body)) {
-          return res
-            .status(400)
-            .json({ error: "Employees can only update their skills" });
+          return res.status(400).json({
+            error: "Employees can only update their skills",
+          });
         }
 
         await conn.execute(
@@ -600,98 +670,162 @@ router.put(
       }
 
       // -----------------------------------------------------------
-      // 3️⃣ Visibility Security Check (Universal)
+      // 3️⃣ Visibility check
       // -----------------------------------------------------------
       const { sqlCondition, binds } = buildVisibilityOracle(creator, {});
       binds.targetId = id;
 
-      const visSql = `
-        SELECT e.id
-        FROM employees e
-        WHERE e.id = :targetId
-        ${sqlCondition}
-      `;
-
-      const visRes = await conn.execute(visSql, binds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
+      const visRes = await conn.execute(
+        `SELECT e.id FROM employees e WHERE e.id = :targetId ${sqlCondition}`,
+        binds,
+        { outFormat: oracledb.OUT_FORMAT_OBJECT }
+      );
 
       if (visRes.rows.length === 0) {
         return res.status(403).json({
-          error: "You are not authorized to update this employee",
+          error: "Not authorized to update this employee",
         });
       }
 
-      // -----------------------------------------------------------
-      // 4️⃣ Manager/Admin Permission Rules
-      // -----------------------------------------------------------
-      if (creator.role === "manager" && employee.MANAGER_ID !== creator.id) {
-        return res
-          .status(403)
-          .json({ error: "Managers can update only their direct employees" });
-      }
-
-      if (creator.role === "admin" && employee.ROLE !== "employee") {
-        return res
-          .status(403)
-          .json({ error: "Admins can only update employees" });
-      }
-
-      // -----------------------------------------------------------
-      // 5️⃣ Duplicate checks (employeeId, email)
-      // -----------------------------------------------------------
-      if (body.employeeId && body.employeeId !== employee.EMPLOYEE_ID) {
-        const dup = await conn.execute(
-          `SELECT employee_id FROM employees WHERE employee_id = :eid`,
-          { eid: body.employeeId },
-          { outFormat: oracledb.OUT_FORMAT_OBJECT }
-        );
-        if (dup.rows.length > 0)
-          return res.status(400).json({ error: "Employee ID already exists" });
-      }
-
-      if (body.email && body.email !== employee.EMAIL) {
-        const dup = await conn.execute(
-          `SELECT email FROM employees WHERE email = :email`,
-          { email: body.email },
-          { outFormat: oracledb.OUT_FORMAT_OBJECT }
-        );
-        if (dup.rows.length > 0)
-          return res.status(400).json({ error: "Email already exists" });
-      }
-
-      // -----------------------------------------------------------
-// 6️⃣ Validate reportingManager ONLY if changed
 // -----------------------------------------------------------
-if (
-  body.reportingManager !== undefined &&
-  body.reportingManager !== employee.REPORTING_MANAGER
-) {
-  const { sqlCondition: rmCond, binds: rmBinds } =
-    buildVisibilityOracle(creator, {});
+// 🔥 Role assignment validation
+// -----------------------------------------------------------
+if (body.role && body.role !== employee.ROLE) {
 
-  rmBinds.rmId = body.reportingManager;
+  const allowedRoleMap = {
+    head_lt: ["lt", "alt", "manager", "admin", "employee"],
+    lt: ["alt", "manager", "admin", "employee"],
+    alt: ["manager", "admin", "employee"],
+    manager: ["admin", "employee"],
+    admin: ["employee"],
+  };
 
-  const rmSql = `
-    SELECT e.id
-    FROM employees e
-    WHERE id = :rmId
-    ${rmCond}
-  `;
+  const allowedRoles = allowedRoleMap[creator.role] || [];
 
-  const rmRes = await conn.execute(rmSql, rmBinds, {
-    outFormat: oracledb.OUT_FORMAT_OBJECT,
-  });
-
-  if (rmRes.rows.length === 0) {
+  if (!allowedRoles.includes(body.role)) {
     return res.status(403).json({
-      error: "You are not authorized to assign this reporting manager",
+      error: `You cannot assign role '${body.role}'`
     });
   }
 }
 
       // -----------------------------------------------------------
-      // 7️⃣ Build UPDATE Query Dynamically
+      // 4️⃣ Manager/Admin restrictions
+      // -----------------------------------------------------------
+      if (creator.role === "manager" && employee.MANAGER_ID !== creator.id) {
+        return res.status(403).json({
+          error: "Managers can update only their employees",
+        });
+      }
+
+      if (creator.role === "admin" && employee.ROLE !== "employee") {
+        return res.status(403).json({
+          error: "Admins can only update employees",
+        });
+      }
+
+      // -----------------------------------------------------------
+      // 5️⃣ Duplicate checks
+      // -----------------------------------------------------------
+      if (body.employeeId && body.employeeId !== employee.EMPLOYEE_ID) {
+        const dup = await conn.execute(
+          `SELECT 1 FROM employees WHERE employee_id = :eid`,
+          { eid: body.employeeId }
+        );
+        if (dup.rows.length > 0)
+          return res.status(400).json({ error: "Employee ID exists" });
+      }
+
+      if (body.email && body.email !== employee.EMAIL) {
+        const dup = await conn.execute(
+          `SELECT 1 FROM employees WHERE email = :email`,
+          { email: body.email }
+        );
+        if (dup.rows.length > 0)
+          return res.status(400).json({ error: "Email exists" });
+      }
+
+      // -----------------------------------------------------------
+      // 6️⃣ Validate reporting manager
+      // -----------------------------------------------------------
+      if (
+        body.reportingManager !== undefined &&
+        body.reportingManager !== employee.REPORTING_MANAGER
+      ) {
+        const { sqlCondition: rmCond, binds: rmBinds } =
+          buildVisibilityOracle(creator, {});
+        rmBinds.rmId = body.reportingManager;
+
+        const rmRes = await conn.execute(
+          `SELECT id FROM employees e WHERE id = :rmId ${rmCond}`,
+          rmBinds
+        );
+
+        if (rmRes.rows.length === 0) {
+          return res.status(403).json({
+            error: "Invalid reporting manager",
+          });
+        }
+      }
+
+      // -----------------------------------------------------------
+// 🔥 Recalculate hierarchy if reporting manager changes
+// -----------------------------------------------------------
+if (
+  body.reportingManager !== undefined &&
+  body.reportingManager !== employee.REPORTING_MANAGER
+) {
+
+  const hierarchy = await resolveHierarchyChain(
+    conn,
+    body.reportingManager
+  );
+
+  body.headLtId = hierarchy.head_lt_id || null;
+  body.ltId = hierarchy.lt_id || null;
+  body.altId = hierarchy.alt_id || null;
+
+  // add mappings dynamically
+  columnMap.headLtId = "HEAD_LT_ID";
+  columnMap.ltId = "LT_ID";
+  columnMap.altId = "ALT_ID";
+}
+      // -----------------------------------------------------------
+      // 🔥 FIX: Extract IDs + convert to names
+      // -----------------------------------------------------------
+      let applicationIds = [];
+
+      if (body.applicationName !== undefined) {
+        applicationIds = body.applicationName
+          ? body.applicationName
+              .split(",")
+              .map((id) => id.trim())
+              .filter(Boolean)
+              .map(Number)
+              .filter((id) => !isNaN(id))
+          : [];
+
+        if (applicationIds.length > 0) {
+          const result = await conn.execute(
+            `SELECT id, name FROM applications 
+             WHERE id IN (${applicationIds
+               .map((_, i) => `:id${i}`)
+               .join(",")})`,
+            Object.fromEntries(
+              applicationIds.map((id, i) => [`id${i}`, id])
+            ),
+            { outFormat: oracledb.OUT_FORMAT_OBJECT }
+          );
+
+          const names = result.rows.map((r) => r.NAME);
+          body.applicationName = names.join(",");
+        } else {
+          body.applicationName = null;
+        }
+      }
+
+      // -----------------------------------------------------------
+      // 7️⃣ Dynamic UPDATE
       // -----------------------------------------------------------
       const fields = {};
       const setClauses = [];
@@ -699,25 +833,40 @@ if (
       for (const [key, value] of Object.entries(body)) {
         const column = columnMap[key];
         if (value !== undefined && column) {
-          if (key === "skills") {
-            setClauses.push(`${column} = :${key}`);
-            fields[key] = JSON.stringify(value || []);
-          } else {
-            setClauses.push(`${column} = :${key}`);
-            fields[key] = value;
-          }
+          setClauses.push(`${column} = :${key}`);
+          fields[key] =
+            key === "skills" ? JSON.stringify(value || []) : value;
         }
       }
 
       if (setClauses.length > 0) {
         fields.id = id;
-        const updateQuery = `
-          UPDATE employees 
-          SET ${setClauses.join(", ")}
-          WHERE id = :id
-        `;
 
-        await conn.execute(updateQuery, fields, { autoCommit: true });
+        await conn.execute(
+          `UPDATE employees SET ${setClauses.join(", ")} WHERE id = :id`,
+          fields,
+          { autoCommit: true }
+        );
+      }
+
+      // -----------------------------------------------------------
+      // 🔥 FIX: Update mapping table using IDs
+      // -----------------------------------------------------------
+      if (body.applicationName !== undefined) {
+        await conn.execute(
+          `DELETE FROM employee_applications WHERE employee_id = :id`,
+          { id }
+        );
+
+        for (const appId of applicationIds) {
+          await conn.execute(
+            `INSERT INTO employee_applications (employee_id, application_id)
+             VALUES (:empId, :appId)`,
+            { empId: id, appId }
+          );
+        }
+
+        await conn.commit();
       }
 
       return res.json({ message: "Employee updated successfully" });
@@ -725,102 +874,7 @@ if (
   }
 );
 
-// GET /employees/reporting-managers
-// router.get("/reporting-managers", authMiddleware(["head_lt", "lt", "alt", "admin", "manager","employee"]), async (req, res) => {
-//   try {
-//     const creator = req.user; // { id, role, managerId }
-//     let managers = [];
-
-//     if (creator.role === "manager") {
-//       // Manager → self + their sub-managers
-//       const selfResult = await executeQuery(
-//         `SELECT id, employee_id, name, role 
-//          FROM employees 
-//          WHERE id = :id`,
-//         [creator.id],
-//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
-//       );
-
-//       const subResult = await executeQuery(
-//         `SELECT id, employee_id, name, role 
-//          FROM employees 
-//          WHERE role IN ('admin','manager') AND manager_id = :id`,
-//         [creator.id],
-//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
-//       );
-
-//       const selfManager = selfResult.rows?.[0] || null;
-//       const subManagers = subResult.rows || [];
-
-//       managers = [
-//         ...(selfManager ? [selfManager] : []),
-//         ...subManagers
-//       ];
-
-//     } else if (creator.role === "admin") {
-//       if (!creator.managerId) {
-//         return res.status(400).json({ error: "Admin is not linked to a manager" });
-//       }
-
-//       // Admin → self + linked manager + sub-managers under that manager
-//       const selfResult = await executeQuery(
-//         `SELECT id, employee_id, name, role 
-//          FROM employees 
-//          WHERE id = :id`,
-//         [creator.id],
-//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
-//       );
-
-//       const linkedResult = await executeQuery(
-//         `SELECT id, employee_id, name, role 
-//          FROM employees 
-//          WHERE id = :mid`,
-//         [creator.managerId],
-//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
-//       );
-
-//       const subResult = await executeQuery(
-//         `SELECT id, employee_id, name, role 
-//          FROM employees 
-//          WHERE role IN ('admin','manager') AND manager_id = :mid AND id != :aid`,
-//         [creator.managerId, creator.id],
-//         { outFormat: oracledb.OUT_FORMAT_OBJECT }
-//       );
-
-//       const selfAdmin = selfResult.rows?.[0] || null;
-//       const linkedManager = linkedResult.rows?.[0] || null;
-//       const subManagers = subResult.rows || [];
-
-//       managers = [
-//         ...(selfAdmin ? [selfAdmin] : []),
-//         ...(linkedManager ? [linkedManager] : []),
-//         ...subManagers
-//       ];
-
-//     } else {
-//       return res.status(403).json({ error: "Unauthorized" });
-//     }
-
-//     if (managers.length === 0) {
-//       return res.json([]); // return empty array if no managers
-//     }
-
-//     // Convert keys to lowercase
-//     const formattedManagers = managers.map(mgr => ({
-//       id: mgr.ID || mgr.id,
-//       employee_id: mgr.EMPLOYEE_ID || mgr.employee_id,
-//       name: mgr.NAME || mgr.name,
-//       role: mgr.ROLE || mgr.role
-//     }));
-
-//     res.json(formattedManagers);
-
-//   } catch (err) {
-//     console.error("Fetching reporting managers failed:", err);
-//     res.status(500).json({ error: err.message });
-//   }
-// });
-
+//REPORTING MANAGER LIST 
 router.get(
   "/reporting-managers",
   authMiddleware(["head_lt", "lt", "alt", "admin", "manager", "employee"]),
@@ -845,17 +899,10 @@ router.get(
     SELECT e.id, e.employee_id, e.name, e.role
     FROM employees e
     WHERE e.role IN ('head_lt', 'lt', 'alt', 'admin', 'manager')
-      AND (
-        e.id = :selfId
-        OR e.manager_id = :managerId
-      )
     ORDER BY e.name
   `;
 
-  binds = {
-    selfId: user.id,
-    managerId: user.id,
-  };
+  binds = {};
 }
       const result = await executeQuery(sql, binds, {
         outFormat: oracledb.OUT_FORMAT_OBJECT,
@@ -874,8 +921,6 @@ router.get(
     }
   }
 );
-
-
 
 // GET /employees/team-leads
 router.get("/team-leads", authMiddleware(["head_lt", "lt", "alt", "admin", "manager"]), async (req, res) => {
