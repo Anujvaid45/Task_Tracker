@@ -387,25 +387,59 @@ const result = await connection.execute(
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-const computeOnTrackStatus = (plannedEnd, projectStage, storedStatus) => {
-  // Preserve Delayed for completed projects
-  if (projectStage === "Live" && storedStatus === "Delayed") return "Delayed";
+const computeOnTrackStatus = (
+  plannedEnd,
+  projectStage,
+  storedStatus,
+  goLiveDate
+) => {
 
   if (!plannedEnd) return "On Track";
+
   const planned = new Date(plannedEnd);
-  if (isNaN(planned.getTime())) return "On Track";
+
+  if (isNaN(planned.getTime()))
+    return "On Track";
+
   planned.setHours(0, 0, 0, 0);
-  return today > planned ? "Delayed" : "On Track";
+
+  // --------------------------------------------------
+  // ✅ LIVE projects → compare actual live date
+  // --------------------------------------------------
+  if (projectStage === "Live") {
+
+    if (!goLiveDate)
+      return storedStatus || "On Track";
+
+    const live = new Date(goLiveDate);
+
+    if (isNaN(live.getTime()))
+      return storedStatus || "On Track";
+
+    live.setHours(0, 0, 0, 0);
+
+    return live > planned
+      ? "Delayed"
+      : "On Track";
+  }
+
+  // --------------------------------------------------
+  // Active projects → compare current date
+  // --------------------------------------------------
+  return today > planned
+    ? "Delayed"
+    : "On Track";
 };
 
     const updatedProjects = [];
 
     for (let project of projects) {
       const storedStatus = project.onTrackStatus;
-      const computedStatus = computeOnTrackStatus(
+const computedStatus = computeOnTrackStatus(
   project.plannedEndDate,
-  project.projectStage,   // 👈
-  project.onTrackStatus   // 👈
+  project.projectStage,
+  project.onTrackStatus,
+  project.goLiveEndDate
 );
 
       // Always return real-time value
@@ -675,14 +709,45 @@ exports.updateProject = async (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-const computeOnTrackStatus = (plannedEnd, projectStage, currentOnTrackStatus) => {
-  // Only preserve Delayed permanently if project is already Live
-  if (projectStage === "Live" && currentOnTrackStatus === "Delayed") return "Delayed";
+// const computeOnTrackStatus = (plannedEnd, projectStage, currentOnTrackStatus) => {
+//   // Only preserve Delayed permanently if project is already Live
+//   if (projectStage === "Live" && currentOnTrackStatus === "Delayed") return "Delayed";
 
-  // Active project — always recompute fresh from the date
+//   // Active project — always recompute fresh from the date
+//   if (!plannedEnd) return "On Track";
+//   const planned = new Date(plannedEnd);
+//   planned.setHours(0, 0, 0, 0);
+//   return today > planned ? "Delayed" : "On Track";
+// };
+
+const computeOnTrackStatus = (
+  plannedEnd,
+  projectStage,
+  currentOnTrackStatus,
+  goLiveDate
+) => {
+
   if (!plannedEnd) return "On Track";
+
   const planned = new Date(plannedEnd);
   planned.setHours(0, 0, 0, 0);
+
+  // --------------------------------------------------
+  // ✅ If project is LIVE, compare actual live date
+  // --------------------------------------------------
+  if (projectStage === "Live") {
+
+    if (!goLiveDate) return "On Track";
+
+    const live = new Date(goLiveDate);
+    live.setHours(0, 0, 0, 0);
+
+    return live > planned ? "Delayed" : "On Track";
+  }
+
+  // --------------------------------------------------
+  // Active project → compare today
+  // --------------------------------------------------
   return today > planned ? "Delayed" : "On Track";
 };
 
@@ -739,6 +804,8 @@ const computeOnTrackStatus = (plannedEnd, projectStage, currentOnTrackStatus) =>
         req.body.discussionDelayReason ??
         currentProject.DISCUSSION_DELAY_REASON,
       team: req.body.team ?? currentProject.TEAM,
+      application_name:
+  req.body.applicationName ?? currentProject.APPLICATION_NAME,
     };
 
     // --------------------------------------------------
@@ -810,7 +877,8 @@ const computeOnTrackStatus = (plannedEnd, projectStage, currentOnTrackStatus) =>
 allowedFields.on_track_status = computeOnTrackStatus(
   allowedFields.planned_end_date,
   allowedFields.project_stage,
-  currentProject.ON_TRACK_STATUS
+  currentProject.ON_TRACK_STATUS,
+  allowedFields.go_live_end_date
 );
 
     // --------------------------------------------------
@@ -874,6 +942,7 @@ allowedFields.on_track_status = computeOnTrackStatus(
       `
       UPDATE projects SET
         module_id = :module_id,
+        application_name = :application_name,
         name = :name,
         description = :description,
         start_date = :start_date,
