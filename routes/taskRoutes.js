@@ -1549,25 +1549,125 @@ router.patch(
         );
 
         if (compIdsToDelete.length) {
-          const deleteBinds = { taskId };
-          const placeholders = compIdsToDelete.map((id, i) => {
-            deleteBinds[`id${i}`] = id;
-            return `:id${i}`;
-          });
 
-          await connection.execute(
-            `
-            DELETE FROM TASK_COMPONENTS
-            WHERE TASK_ID = :taskId
-              AND TASK_COMPONENT_ID IN (${placeholders.join(",")})
-            `,
-            deleteBinds,
-            { autoCommit: false }
-          );
-        }
+  const deleteBinds = {};
+
+const placeholders = compIdsToDelete.map((id, i) => {
+  deleteBinds[`id${i}`] = id;
+  return `:id${i}`;
+});
+
+// ---------------------------------------------------------
+// ✅ Delete associated worklogs first
+// ---------------------------------------------------------
+await connection.execute(
+  `
+  DELETE FROM COMPONENT_WORKLOGS
+  WHERE TASK_COMPONENT_ID IN (${placeholders.join(",")})
+  `,
+  deleteBinds,
+  { autoCommit: false }
+);
+
+// ---------------------------------------------------------
+// ✅ Delete components
+// ---------------------------------------------------------
+await connection.execute(
+  `
+  DELETE FROM TASK_COMPONENTS
+  WHERE TASK_ID = :taskId
+    AND TASK_COMPONENT_ID IN (${placeholders.join(",")})
+  `,
+  {
+    ...deleteBinds,
+    taskId,
+  },
+  { autoCommit: false }
+);
+}
 
         await connection.commit();
       }
+      // -------------------------------------------------------------------------
+// ✅ STEP 4.5 — Recalculate task lifecycle from components
+// -------------------------------------------------------------------------
+
+const taskCompStatusRes = await connection.execute(
+  `
+  SELECT STATUS, COMPLETED_AT
+  FROM TASK_COMPONENTS
+  WHERE TASK_ID = :taskId
+  `,
+  { taskId },
+  { outFormat: oracledb.OUT_FORMAT_OBJECT }
+);
+
+const rows = taskCompStatusRes.rows || [];
+
+const completedStatuses = ["Live", "Preprod_Signoff"];
+
+const wipStatuses = [
+  "Under_Development",
+  "Under_QA",
+  "Under_UAT",
+  "UAT_Signoff",
+  "Under_Preprod",
+];
+
+let recalculatedTaskStatus = "Pending";
+let recalculatedCompletedAt = null;
+
+if (rows.length) {
+
+  const allCompleted = rows.every((r) =>
+    completedStatuses.includes(r.STATUS)
+  );
+
+  const anyWip = rows.some((r) =>
+    wipStatuses.includes(r.STATUS)
+  );
+
+  const anyPending = rows.some((r) =>
+    r.STATUS === "Pending"
+  );
+
+  if (allCompleted) {
+
+    recalculatedTaskStatus = "Completed";
+
+    recalculatedCompletedAt =
+      rows
+        .map((r) => r.COMPLETED_AT)
+        .filter(Boolean)
+        .sort((a, b) => new Date(b) - new Date(a))[0] ||
+      new Date();
+
+  } else if (anyWip || anyPending) {
+
+    recalculatedTaskStatus = "WIP";
+    recalculatedCompletedAt = null;
+
+  }
+}
+
+// ✅ Persist recalculated values
+await connection.execute(
+  `
+  UPDATE TASKS
+  SET
+    STATUS = :status,
+    COMPLETED_AT = :completedAt,
+    UPDATED_AT = SYSTIMESTAMP
+  WHERE TASK_ID = :taskId
+  `,
+  {
+    status: recalculatedTaskStatus,
+    completedAt: recalculatedCompletedAt,
+    taskId,
+  },
+  { autoCommit: false }
+);
+
       const fieldMap = {
   employeeId: "E_ID",
   projectId: "PROJECT_ID",
