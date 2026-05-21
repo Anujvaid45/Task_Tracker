@@ -8,6 +8,7 @@ const router = express.Router();
 
 router.post("/register", async (req, res) => {
   let connection;
+
   try {
     const {
       employeeId,
@@ -16,27 +17,27 @@ router.post("/register", async (req, res) => {
       password,
       role,
       designation,
-      reportingManager, // ID of their manager, if applicable
+      reportingManager,
       applicationName,
       location,
       secret,
     } = req.body;
 
-    // 🔒 1️⃣ Check security secret
+    // 🔒 1️⃣ Security check
     if (secret !== process.env.NEW_REGISTER_SECRET) {
       return res.status(403).json({ error: "Unauthorized access" });
     }
 
-    // 🔍 2️⃣ Validate required fields
+    // 🔍 2️⃣ Validation
     if (!employeeId || !name || !email || !password || !role) {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
     connection = await oracledb.getConnection();
 
-    // 🛑 3️⃣ Prevent duplicate employee ID
+    // 🛑 3️⃣ Duplicate check
     const existing = await connection.execute(
-      "SELECT 1 FROM employees WHERE employee_id = :employeeId",
+      `SELECT 1 FROM employees WHERE employee_id = :employeeId`,
       { employeeId },
       { outFormat: oracledb.OUT_FORMAT_OBJECT }
     );
@@ -48,29 +49,69 @@ router.post("/register", async (req, res) => {
     // 🔑 4️⃣ Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // 🧩 5️⃣ Auto-resolve hierarchy if there’s a reporting manager
+    // 🧩 5️⃣ Resolve hierarchy
     let hierarchy = {};
     if (reportingManager) {
       hierarchy = await resolveHierarchyChain(connection, reportingManager);
     }
 
-    // 🧾 6️⃣ Build parameters for insertion
-    const binds = {
-      employeeId,
-      name,
-      email,
-      password: hashedPassword,
-      role,
-      designation: designation || null,
-      reportingManager: reportingManager || null,
-      applicationName: applicationName || null,
-      location: location || null,
-      headLtId: hierarchy.head_lt_id || null,
-      ltId: hierarchy.lt_id || null,
-      altId: hierarchy.alt_id || null,
-    };
+    // ---------------------------------------------------------
+    // 🔹 6️⃣ Handle MULTIPLE Applications
+    // ---------------------------------------------------------
+    let applicationIds = [];
 
-    // 💾 7️⃣ Insert new user
+    if (applicationName && applicationName !== "all") {
+      const apps = [
+        ...new Set(
+          applicationName
+            .split(",")
+            .map((a) => a.trim())
+            .filter(Boolean)
+        ),
+      ];
+
+      for (const app of apps) {
+        // 🔍 Check if application exists
+        const appCheck = await connection.execute(
+          `SELECT id FROM applications WHERE LOWER(name) = LOWER(:name)`,
+          { name: app },
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+
+        let appId;
+
+        if (appCheck.rows.length > 0) {
+          appId = appCheck.rows[0].ID;
+        } else {
+          // ➕ Insert new application
+          const insertApp = await connection.execute(
+            `INSERT INTO applications (id, name)
+             VALUES (applications_seq.NEXTVAL, :name)
+             RETURNING id INTO :id`,
+            {
+              name: app,
+              id: { dir: oracledb.BIND_OUT, type: oracledb.NUMBER },
+            }
+          );
+
+          appId = insertApp.outBinds.id[0];
+        }
+
+        applicationIds.push(appId);
+      }
+    }
+
+    // ---------------------------------------------------------
+    // 🔹 7️⃣ Insert Employee
+    // ---------------------------------------------------------
+    const normalizedApplicationName = applicationName
+      ? applicationName
+          .split(",")
+          .map((a) => a.trim())
+          .filter(Boolean)
+          .join(",")
+      : null;
+
     await connection.execute(
       `
       INSERT INTO EMPLOYEES (
@@ -84,22 +125,76 @@ router.post("/register", async (req, res) => {
         :headLtId, :ltId, :altId, 'active', SYSTIMESTAMP
       )
       `,
-      binds,
-      { autoCommit: true }
+      {
+        employeeId,
+        name,
+        email,
+        password: hashedPassword,
+        role,
+        designation: designation || null,
+        reportingManager: reportingManager || null,
+        applicationName: normalizedApplicationName,
+        location: location || null,
+        headLtId: hierarchy.head_lt_id || null,
+        ltId: hierarchy.lt_id || null,
+        altId: hierarchy.alt_id || null,
+      }
     );
+
+    // ---------------------------------------------------------
+    // 🔹 8️⃣ Get inserted employee PK
+    // ---------------------------------------------------------
+    const empResult = await connection.execute(
+      `SELECT id FROM employees WHERE employee_id = :employeeId`,
+      { employeeId },
+      { outFormat: oracledb.OUT_FORMAT_OBJECT }
+    );
+
+    const empId = empResult.rows[0].ID;
+
+    // ---------------------------------------------------------
+    // 🔹 9️⃣ Insert into employee_applications (NO DUPLICATES)
+    // ---------------------------------------------------------
+    for (const appId of applicationIds) {
+      await connection.execute(
+        `
+        INSERT INTO employee_applications (employee_id, application_id)
+        SELECT :empId, :appId FROM dual
+        WHERE NOT EXISTS (
+          SELECT 1 FROM employee_applications
+          WHERE employee_id = :empId AND application_id = :appId
+        )
+        `,
+        { empId, appId }
+      );
+    }
+
+    // ---------------------------------------------------------
+    // 🔹 🔟 Commit transaction
+    // ---------------------------------------------------------
+    await connection.commit();
 
     res.json({
       message: `Registered ${role} successfully!`,
       hierarchy,
     });
+
   } catch (err) {
-    console.log(err)
     console.error("Registration error:", err);
+
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (e) {}
+    }
+
     res.status(500).json({ error: err.message });
+
   } finally {
     if (connection) await connection.close();
   }
 });
+
 
 
 // 🔹 Login
