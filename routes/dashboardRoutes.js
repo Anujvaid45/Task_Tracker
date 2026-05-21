@@ -732,7 +732,7 @@ router.get(
 
       const user = req.user;
       const { sqlCondition, binds } = buildVisibilityOracle(user, req.query);
-      const { applicationId, tlId, zeroHours } = req.query; // 👈 added zeroHours
+      const { applicationId, tlId, zeroHours,nonLive } = req.query; // 👈 added zeroHours
 
       let where = "";
       let finalBinds = { ...binds };
@@ -774,7 +774,13 @@ router.get(
         where += ` AND m.application_id = :applicationId`;
         finalBinds.applicationId = Number(applicationId);
       }
+// ---------------------------------------------------------
+// ✅ Non-live projects filter
+// ---------------------------------------------------------
 
+if (nonLive === "true") {
+  where += ` AND p.project_stage != 'Live'`;
+}
       finalBinds.today = new Date();
       finalBinds.zeroHours = zeroHours === "true" ? 1 : 0; // 👈 added bind
 
