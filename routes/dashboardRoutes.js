@@ -324,15 +324,16 @@ router.get(
           t.module_id,
           t.project_id,
           NVL(t.workload_hours, 0) AS total_hours,
-          SUM(
-            CASE 
-              WHEN t.status NOT IN ('Live','Dropped','Completed')
-                   AND TRUNC(t.due_date) < TRUNC(:today)
-              THEN NVL(t.workload_hours, 0)
-              ELSE 0
-            END
-          ) AS overdue_hours
+        t.status,
+  t.due_date,
+
+        NVL(SUM(cw.hours_logged), 0) AS completed_hours
         FROM tasks t
+        LEFT JOIN task_components tc
+    ON tc.task_id = t.task_id
+
+LEFT JOIN component_worklogs cw
+    ON cw.task_component_id = tc.task_component_id
         JOIN employees e ON t.e_id = e.id
         WHERE 1 = 1
         ${sqlCondition}
@@ -341,13 +342,15 @@ router.get(
           t.e_id,
           t.module_id,
           t.project_id,
-          t.workload_hours
+          t.workload_hours,
+          t.status,
+          t.due_date
       `;
 
       const taskBase = await connection.execute(
         taskBaseSQL,
         {
-          today,
+          
           ...visibilityBinds,
         },
         { outFormat: oracledb.OUT_FORMAT_OBJECT }
@@ -513,7 +516,20 @@ router.get(
         workloadMap[key].total += total;
         workloadMap[key].completed += completed;
         workloadMap[key].pending += pending;
-        workloadMap[key].overdue += row.OVERDUE_HOURS || 0;
+        const isOverdue =
+  row.STATUS !== "Live" &&
+  row.STATUS !== "Dropped" &&
+  row.STATUS !== "Completed" &&
+  row.DUE_DATE &&
+  new Date(row.DUE_DATE) < new Date();
+
+const overdue = isOverdue
+  ? pending
+  : 0;
+
+workloadMap[key].overdue += overdue;
+        // workloadMap[key].overdue += row.OVERDUE_HOURS || 0;
+        
         workloadMap[key].monthLogged += logs.month || 0;
 
         type === "task"
@@ -634,7 +650,6 @@ res.json(
     });
   }
 );
-
 
 
 // ------------------ MODULE SUMMARY ROUTE ------------------
@@ -1346,26 +1361,106 @@ router.get(
 // ---------------------- Tasks Progress Weekly ----------------------
 router.get(
   "/tasks-progress-weekly",
-  authMiddleware(["admin", "manager", "lt","alt", "head_lt"]),
+  authMiddleware(["admin", "manager", "lt", "alt", "head_lt"]),
   async (req, res) => {
     return safeRoute(req, res, async (connection) => {
+
       const { month, year } = req.query;
-      if (!month || !year)
-        return res.status(400).json({ error: "month and year are required" });
 
+      if (!month || !year) {
+        return res
+          .status(400)
+          .json({ error: "month and year are required" });
+      }
 
-      // 🔹 Hierarchy + visibility filter
-      const { sqlCondition, binds } = buildVisibilityOracle(req.user, req.query);
+      // --------------------------------------------------------------------------
+      // Visibility
+      // --------------------------------------------------------------------------
 
-      // 🔹 Date filter for the selected month
-      const startDate = new Date(Number(year), Number(month) - 1, 1);
-      const endDate = new Date(Number(year), Number(month), 0, 23, 59, 59);
+      const { sqlCondition, binds } =
+        buildVisibilityOracle(req.user, req.query);
+
+      const startDate = new Date(
+        Number(year),
+        Number(month) - 1,
+        1
+      );
+
+      const endDate = new Date(
+        Number(year),
+        Number(month),
+        0,
+        23,
+        59,
+        59
+      );
+
       binds.startDate = startDate;
       binds.endDate = endDate;
 
-      // --------------------------------------------------------------------------------
-      // STEP 1️⃣ - Get tasks due OR worked in this month
-      // --------------------------------------------------------------------------------
+      // --------------------------------------------------------------------------
+      // REAL CALENDAR WEEK CALCULATION
+      // --------------------------------------------------------------------------
+
+      const getWeekNumberInMonth = (dateInput) => {
+
+        const date =
+          dateInput instanceof Date
+            ? new Date(dateInput)
+            : new Date(dateInput);
+
+        const firstDay =
+          new Date(
+            date.getFullYear(),
+            date.getMonth(),
+            1
+          ).getDay();
+
+        return Math.ceil(
+          (date.getDate() + firstDay) / 7
+        );
+      };
+
+      // --------------------------------------------------------------------------
+      // DATE PARSER
+      // --------------------------------------------------------------------------
+
+      const parseOracleDate = (val) => {
+
+        if (!val) return null;
+
+        const d =
+          val instanceof Date
+            ? val
+            : new Date(val);
+
+        return isNaN(d.getTime())
+          ? null
+          : d;
+      };
+
+      // --------------------------------------------------------------------------
+      // TODAY
+      // --------------------------------------------------------------------------
+
+      const today = new Date();
+
+      const todayDateOnly = new Date(
+        today.getFullYear(),
+        today.getMonth(),
+        today.getDate()
+      );
+
+      const currentWeek =
+        today.getFullYear() == Number(year) &&
+        today.getMonth() + 1 == Number(month)
+          ? getWeekNumberInMonth(today)
+          : 0;
+
+      // --------------------------------------------------------------------------
+      // TASK QUERY
+      // --------------------------------------------------------------------------
+
       const taskQuery = `
         SELECT 
           t.task_id,
@@ -1373,74 +1468,84 @@ router.get(
           t.status,
           t.due_date,
           t.completed_at,
+          t.workload_hours,
+
           e.id AS employee_id,
           e.name AS employee_name,
-          NVL(t.workload_hours, 0) AS workload_hours
+
+          NVL(logs.logged_hours, 0) AS logged_hours,
+          logs.last_log_date
+
         FROM tasks t
-        JOIN employees e ON t.e_id = e.id
+
+        JOIN employees e
+          ON t.e_id = e.id
+
+        LEFT JOIN (
+          SELECT
+            tc.task_id,
+
+            SUM(
+              NVL(cw.hours_logged, 0)
+            ) AS logged_hours,
+
+            MAX(cw.log_date) AS last_log_date
+
+          FROM task_components tc
+
+          LEFT JOIN component_worklogs cw
+            ON cw.task_component_id =
+               tc.task_component_id
+
+          GROUP BY tc.task_id
+        ) logs
+          ON logs.task_id = t.task_id
+
         WHERE (
           t.due_date BETWEEN :startDate AND :endDate
-          OR EXISTS (
-            SELECT 1 FROM component_worklogs cw
-            JOIN task_components tc ON cw.task_component_id = tc.task_component_id
-            WHERE tc.task_id = t.task_id
-              AND cw.log_date BETWEEN :startDate AND :endDate
-          )
+
+          OR logs.last_log_date BETWEEN :startDate AND :endDate
+
+          OR t.completed_at BETWEEN :startDate AND :endDate
         )
+
         ${sqlCondition}
-        ORDER BY t.due_date ASC
+
+        ORDER BY
+          NVL(logs.last_log_date, t.due_date) ASC
       `;
 
-      const taskResult = await connection.execute(taskQuery, binds, {
-        outFormat: oracledb.OUT_FORMAT_OBJECT,
-      });
+      const taskResult = await connection.execute(
+        taskQuery,
+        binds,
+        {
+          outFormat:
+            oracledb.OUT_FORMAT_OBJECT,
+        }
+      );
 
       const tasks = taskResult.rows || [];
-      if (!tasks.length)
+
+      if (!tasks.length) {
         return res.json({
           weekly: [],
           dueThisWeek: [],
           weeklyStats: {},
           monthlyOverview: {},
+          currentWeek,
         });
-
-      // --------------------------------------------------------------------------------
-      // STEP 2️⃣ - Get total logged hours for each task (for partial tracking)
-      // --------------------------------------------------------------------------------
-      const taskIds = tasks.map((t) => t.TASK_ID);
-      let logMap = {};
-
-      if (taskIds.length > 0) {
-        const logQuery = `
-          SELECT 
-            tc.task_id,
-            SUM(NVL(cw.hours_logged, 0)) AS logged_hours
-          FROM component_worklogs cw
-          JOIN task_components tc ON cw.task_component_id = tc.task_component_id
-          WHERE cw.log_date BETWEEN :startDate AND :endDate
-            AND tc.task_id IN (${taskIds.map((_, i) => `:tid${i}`).join(",")})
-          GROUP BY tc.task_id
-        `;
-
-        const logBinds = {
-          startDate,
-          endDate,
-          ...taskIds.reduce((acc, id, i) => ({ ...acc, [`tid${i}`]: id }), {}),
-        };
-
-        const logResult = await connection.execute(logQuery, logBinds, {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-        });
-
-        logMap = Object.fromEntries(
-          logResult.rows.map((r) => [r.TASK_ID, r.LOGGED_HOURS || 0])
-        );
       }
 
-      // --------------------------------------------------------------------------------
-      // STEP 3️⃣ - Categorization setup
-      // --------------------------------------------------------------------------------
-      const completedStatuses = ["Live", "Preprod_Signoff", "Completed"];
+      // --------------------------------------------------------------------------
+      // STATUS GROUPS
+      // --------------------------------------------------------------------------
+
+      const completedStatuses = [
+        "Live",
+        "Preprod_Signoff",
+        "Completed",
+      ];
+
       const inProgressStatuses = [
         "Under_Development",
         "Under_UAT",
@@ -1449,6 +1554,7 @@ router.get(
         "Under_QA",
         "WIP",
       ];
+
       const pendingStatuses = [
         "BRS_Discussion",
         "Approach_Preparation",
@@ -1456,131 +1562,357 @@ router.get(
         "Pending",
       ];
 
-      const getWeekNumberInMonth = (date) => Math.ceil(new Date(date).getDate() / 7);
+      // --------------------------------------------------------------------------
+      // CONTAINERS
+      // --------------------------------------------------------------------------
 
       const employeeWeekly = {};
+
       const dueThisWeekTasks = [];
-      const weeklyStats = { 1: {}, 2: {}, 3: {}, 4: {}, 5: {} };
-      Object.keys(weeklyStats).forEach(
-        (k) =>
-          (weeklyStats[k] = {
-            completed: 0,
-            inProgress: 0,
-            pending: 0,
-            overdue: 0,
-          })
-      );
 
-      const today = new Date();
-      const currentWeek =
-        today.getFullYear() == year && today.getMonth() + 1 == Number(month)
-          ? getWeekNumberInMonth(today)
-          : 0;
-
-      const todayDateOnly = new Date(
-        today.getFullYear(),
-        today.getMonth(),
-        today.getDate()
-      );
-
-      // Helper to safely parse Oracle dates
-      const parseOracleDate = (val) => {
-        if (!val) return null;
-        const d = val instanceof Date ? val : new Date(val);
-        return isNaN(d.getTime()) ? null : d;
+      const weeklyStats = {
+        1: {},
+        2: {},
+        3: {},
+        4: {},
+        5: {},
+        6: {},
       };
 
-      // --------------------------------------------------------------------------------
-      // STEP 4️⃣ - Process tasks
-      // --------------------------------------------------------------------------------
+      Object.keys(weeklyStats).forEach((k) => {
+
+        weeklyStats[k] = {
+          completed: 0,
+          inProgress: 0,
+          pending: 0,
+          overdue: 0,
+
+          workloadHours: 0,
+          loggedHours: 0,
+          remainingHours: 0,
+        };
+      });
+
+      // --------------------------------------------------------------------------
+      // PROCESS TASKS
+      // --------------------------------------------------------------------------
+
       for (const task of tasks) {
-        const empId = task.EMPLOYEE_ID?.toString() || "unknown";
-        const empName = task.EMPLOYEE_NAME || "Unknown";
+
+        const empId =
+          task.EMPLOYEE_ID?.toString() ||
+          "unknown";
+
+        const empName =
+          task.EMPLOYEE_NAME || "Unknown";
+
+        // ------------------------------------------------------------
+        // INIT EMPLOYEE
+        // ------------------------------------------------------------
 
         if (!employeeWeekly[empId]) {
+
           employeeWeekly[empId] = {
             employeeId: empId,
             name: empName,
-            weekly: { 1: {}, 2: {}, 3: {}, 4: {}, 5: {} },
+
+            weekly: {
+              1: {},
+              2: {},
+              3: {},
+              4: {},
+              5: {},
+              6: {},
+            },
           };
-          Object.keys(employeeWeekly[empId].weekly).forEach(
-            (k) =>
-              (employeeWeekly[empId].weekly[k] = {
-                completed: 0,
-                inProgress: 0,
-                pending: 0,
-                overdue: 0,
-              })
-          );
+
+          Object.keys(
+            employeeWeekly[empId].weekly
+          ).forEach((k) => {
+
+            employeeWeekly[empId].weekly[k] = {
+              completed: 0,
+              inProgress: 0,
+              pending: 0,
+              overdue: 0,
+
+              workloadHours: 0,
+              loggedHours: 0,
+              remainingHours: 0,
+            };
+          });
         }
 
-        const dueDate = parseOracleDate(task.DUE_DATE);
-        const completedAt = parseOracleDate(task.COMPLETED_AT);
-        if (!dueDate) continue;
+        // ------------------------------------------------------------
+        // DATES
+        // ------------------------------------------------------------
 
-        const dueWeek = getWeekNumberInMonth(dueDate);
-        const loggedHours = logMap[task.TASK_ID] || 0;
-        const totalHours = task.WORKLOAD_HOURS || 0;
-        const isOverdue = dueDate < todayDateOnly;
+        const dueDate =
+          parseOracleDate(task.DUE_DATE);
 
-        // 🔹 Categorization logic
-        if (completedStatuses.includes(task.STATUS)) {
-  const week = completedAt ? getWeekNumberInMonth(completedAt) : dueWeek;
-  employeeWeekly[empId].weekly[week].completed++;
-  weeklyStats[week].completed++;
-}
+        const completedAt =
+          parseOracleDate(task.COMPLETED_AT);
 
-else if (inProgressStatuses.includes(task.STATUS)) {
-  // ✅ Fix: preserve overdue logic here too
-  if (isOverdue) {
-    employeeWeekly[empId].weekly[dueWeek].overdue++;
-    weeklyStats[dueWeek].overdue++;
-  } else {
-    employeeWeekly[empId].weekly[dueWeek].inProgress++;
-    weeklyStats[dueWeek].inProgress++;
-  }
-}
+        const lastLogDate =
+          parseOracleDate(task.LAST_LOG_DATE);
 
-else if (pendingStatuses.includes(task.STATUS)) {
-  if (isOverdue) {
-    employeeWeekly[empId].weekly[dueWeek].overdue++;
-    weeklyStats[dueWeek].overdue++;
-  } else {
-    employeeWeekly[empId].weekly[dueWeek].pending++;
-    weeklyStats[dueWeek].pending++;
-  }
-}
+        // ------------------------------------------------------------
+        // HOURS
+        // ------------------------------------------------------------
 
+        const totalHours =
+          task.WORKLOAD_HOURS || 0;
 
-        if (dueWeek === currentWeek) {
+        const loggedHours =
+          task.LOGGED_HOURS || 0;
+
+        const remainingHours =
+          Math.max(
+            totalHours - loggedHours,
+            0
+          );
+
+        const completionPercent =
+          totalHours > 0
+            ? (loggedHours / totalHours) * 100
+            : 0;
+
+        // ------------------------------------------------------------
+        // OVERDUE
+        // ------------------------------------------------------------
+
+        const isOverdue =
+          !completedStatuses.includes(
+            task.STATUS
+          ) &&
+          dueDate &&
+          dueDate < todayDateOnly;
+
+        // ------------------------------------------------------------
+        // WEEK DETERMINATION
+        // ------------------------------------------------------------
+
+        let trackingWeek = 1;
+
+        // completed tasks -> completion week
+        if (
+          completedStatuses.includes(
+            task.STATUS
+          ) &&
+          completedAt
+        ) {
+
+          trackingWeek =
+            getWeekNumberInMonth(
+              completedAt
+            );
+        }
+
+        // in-progress -> latest worklog week
+        else if (
+          inProgressStatuses.includes(
+            task.STATUS
+          ) &&
+          lastLogDate
+        ) {
+
+          trackingWeek =
+            getWeekNumberInMonth(
+              lastLogDate
+            );
+        }
+
+        // pending -> due week
+        else if (dueDate) {
+
+          trackingWeek =
+            getWeekNumberInMonth(
+              dueDate
+            );
+        }
+
+        trackingWeek = Math.min(
+          Math.max(trackingWeek, 1),
+          6
+        );
+
+        // ------------------------------------------------------------
+        // WORKLOAD METRICS
+        // ------------------------------------------------------------
+
+        employeeWeekly[empId]
+          .weekly[trackingWeek]
+          .workloadHours += totalHours;
+
+        employeeWeekly[empId]
+          .weekly[trackingWeek]
+          .loggedHours += loggedHours;
+
+        employeeWeekly[empId]
+          .weekly[trackingWeek]
+          .remainingHours += remainingHours;
+
+        weeklyStats[trackingWeek]
+          .workloadHours += totalHours;
+
+        weeklyStats[trackingWeek]
+          .loggedHours += loggedHours;
+
+        weeklyStats[trackingWeek]
+          .remainingHours += remainingHours;
+
+        // ------------------------------------------------------------
+        // TASK COUNTS
+        // ------------------------------------------------------------
+
+        // COMPLETED
+        if (
+          completedStatuses.includes(
+            task.STATUS
+          )
+        ) {
+
+          employeeWeekly[empId]
+            .weekly[trackingWeek]
+            .completed++;
+
+          weeklyStats[trackingWeek]
+            .completed++;
+        }
+
+        // PARTIAL PROGRESS
+        else if (
+          loggedHours > 0 ||
+          inProgressStatuses.includes(
+            task.STATUS
+          )
+        ) {
+
+          if (isOverdue) {
+
+            employeeWeekly[empId]
+              .weekly[trackingWeek]
+              .overdue++;
+
+            weeklyStats[trackingWeek]
+              .overdue++;
+
+          } else {
+
+            employeeWeekly[empId]
+              .weekly[trackingWeek]
+              .inProgress++;
+
+            weeklyStats[trackingWeek]
+              .inProgress++;
+          }
+        }
+
+        // PURE PENDING
+        else {
+
+          if (isOverdue) {
+
+            employeeWeekly[empId]
+              .weekly[trackingWeek]
+              .overdue++;
+
+            weeklyStats[trackingWeek]
+              .overdue++;
+
+          } else {
+
+            employeeWeekly[empId]
+              .weekly[trackingWeek]
+              .pending++;
+
+            weeklyStats[trackingWeek]
+              .pending++;
+          }
+        }
+
+        // ------------------------------------------------------------
+        // DUE THIS WEEK
+        // ------------------------------------------------------------
+
+        if (
+          dueDate &&
+          getWeekNumberInMonth(dueDate) ===
+            currentWeek &&
+          dueDate.getMonth() + 1 ===
+            Number(month) &&
+          dueDate.getFullYear() ===
+            Number(year)
+        ) {
+
           dueThisWeekTasks.push({
             taskId: task.TASK_ID,
             title: task.TITLE,
+
             employee: empName,
-            dueDate: formatDateForDisplay(task.DUE_DATE),
+
+            dueDate:
+              formatDateForDisplay(
+                task.DUE_DATE
+              ),
+
             status: task.STATUS,
+
+            loggedHours,
+            remainingHours,
+
+            completionPercent:
+              Math.round(
+                completionPercent
+              ),
+
             isOverdue,
           });
         }
       }
 
-      // --------------------------------------------------------------------------------
-      // STEP 5️⃣ - Monthly summary
-      // --------------------------------------------------------------------------------
+      // --------------------------------------------------------------------------
+      // MONTHLY OVERVIEW
+      // --------------------------------------------------------------------------
+
       const monthlyOverview = {
         completed: 0,
         inProgress: 0,
         pending: 0,
         overdue: 0,
+
+        workloadHours: 0,
+        loggedHours: 0,
+        remainingHours: 0,
+
         total: 0,
       };
 
-      Object.values(weeklyStats).forEach((w) => {
-        monthlyOverview.completed += w.completed;
-        monthlyOverview.inProgress += w.inProgress;
-        monthlyOverview.pending += w.pending;
-        monthlyOverview.overdue += w.overdue;
-      });
+      Object.values(weeklyStats).forEach(
+        (w) => {
+
+          monthlyOverview.completed +=
+            w.completed;
+
+          monthlyOverview.inProgress +=
+            w.inProgress;
+
+          monthlyOverview.pending +=
+            w.pending;
+
+          monthlyOverview.overdue +=
+            w.overdue;
+
+          monthlyOverview.workloadHours +=
+            w.workloadHours;
+
+          monthlyOverview.loggedHours +=
+            w.loggedHours;
+
+          monthlyOverview.remainingHours +=
+            w.remainingHours;
+        }
+      );
 
       monthlyOverview.total =
         monthlyOverview.completed +
@@ -1589,28 +1921,49 @@ else if (pendingStatuses.includes(task.STATUS)) {
         monthlyOverview.overdue;
 
       monthlyOverview.completionRate =
-        monthlyOverview.total > 0
-          ? Math.round((monthlyOverview.completed / monthlyOverview.total) * 100)
+        monthlyOverview.workloadHours > 0
+          ? Math.round(
+              (
+                monthlyOverview.loggedHours /
+                monthlyOverview.workloadHours
+              ) * 100
+            )
           : 0;
 
-      // --------------------------------------------------------------------------------
-      // STEP 6️⃣ - Send Response
-      // --------------------------------------------------------------------------------
-      const responsePayload = {
-        weekly: Object.values(employeeWeekly),
-        dueThisWeek: dueThisWeekTasks,
+      // --------------------------------------------------------------------------
+      // RESPONSE
+      // --------------------------------------------------------------------------
+
+      res.json({
+        weekly:
+          Object.values(employeeWeekly),
+
+        dueThisWeek:
+          dueThisWeekTasks,
+
         weeklyStats,
+
         monthlyOverview,
+
         currentWeek,
+
         selectedMonth: {
           month: Number(month),
+
           year: Number(year),
-          monthName: new Date(year, month - 1).toLocaleString("default", {
-            month: "long",
-          }),
+
+          monthName: new Date(
+            year,
+            month - 1
+          ).toLocaleString(
+            "default",
+            {
+              month: "long",
+            }
+          ),
         },
-      };
-      res.json(responsePayload);
+      });
+
     });
   }
 );
