@@ -1694,6 +1694,14 @@ if (updateData.dueDate) {
 if (updateData.completedAt) {
   updateData.completedAt = new Date(updateData.completedAt);
 }
+if (Array.isArray(req.body.components)) {
+
+  // ✅ prevent stale frontend overwrite
+  delete updateData.WORKLOAD_HOURS;
+  delete updateData.status;
+  delete updateData.completedAt;
+
+}
 
 Object.entries(updateData).forEach(([key, value]) => {
   const dbColumn = fieldMap[key] || fieldMap[key.toUpperCase()];
