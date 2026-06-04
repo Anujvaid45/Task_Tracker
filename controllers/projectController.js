@@ -426,9 +426,17 @@ const computeOnTrackStatus = (
   // --------------------------------------------------
   // Active projects → compare current date
   // --------------------------------------------------
+  if(projectStage != "Hold")
+  {
   return today > planned
     ? "Delayed"
     : "On Track";
+  }
+
+  if(projectStage === "Hold")
+  {
+    return "On Hold"
+  }
 };
 
     const updatedProjects = [];
@@ -444,7 +452,7 @@ const computedStatus = computeOnTrackStatus(
 
       // Always return real-time value
       project.onTrackStatus = computedStatus;
-
+console.log(storedStatus,computedStatus)
       // Sync DB only if mismatch
       if (storedStatus !== computedStatus) {
         await connection.execute(
@@ -727,6 +735,13 @@ const computeOnTrackStatus = (
   goLiveDate
 ) => {
 
+  // --------------------------------------------------
+// HOLD projects are frozen
+// --------------------------------------------------
+if (projectStage === "Hold") {
+  return "On Hold";
+}
+
   if (!plannedEnd) return "On Track";
 
   const planned = new Date(plannedEnd);
@@ -822,64 +837,101 @@ const computeOnTrackStatus = (
       "Under_Preprod",
       "Preprod_Signoff",
       "Live",
+      "Hold",
     ];
 
     const oldStageIndex = stages.indexOf(currentProject.PROJECT_STAGE);
     const newStageIndex = stages.indexOf(allowedFields.project_stage);
+const isHoldProject =
+  allowedFields.project_stage === "Hold";
 
-    // Sprint dates
-    if (newStageIndex >= stages.indexOf("Under_Development")) {
-      allowedFields.sprint_start_date =
-        currentProject.SPRINT_START_DATE ||
-        (allowedFields.project_stage === "Under_Development" ? today : null);
+if (isHoldProject) {
 
-      allowedFields.sprint_end_date =
-        currentProject.PROJECT_STAGE === "Under_Development" &&
-        newStageIndex > oldStageIndex
-          ? today
-          : currentProject.SPRINT_END_DATE || null;
-    } else {
-      allowedFields.sprint_start_date = null;
-      allowedFields.sprint_end_date = null;
-    }
+  // Freeze existing values
+  allowedFields.sprint_start_date =
+    currentProject.SPRINT_START_DATE;
 
-    // UAT release date
-    const uatIndex = stages.indexOf("UAT_Signoff");
-    allowedFields.uat_release_date =
-      oldStageIndex < uatIndex && newStageIndex >= uatIndex
-        ? currentProject.UAT_RELEASE_DATE || today
-        : newStageIndex < uatIndex
-        ? null
-        : currentProject.UAT_RELEASE_DATE;
+  allowedFields.sprint_end_date =
+    currentProject.SPRINT_END_DATE;
 
-    // Go-live date
-    const liveIndex = stages.indexOf("Live");
-    allowedFields.go_live_end_date =
-      oldStageIndex < liveIndex && newStageIndex >= liveIndex
-        ? currentProject.GO_LIVE_END_DATE || today
-        : newStageIndex < liveIndex
-        ? null
-        : currentProject.GO_LIVE_END_DATE;
+  allowedFields.uat_release_date =
+    currentProject.UAT_RELEASE_DATE;
 
+  allowedFields.go_live_end_date =
+    currentProject.GO_LIVE_END_DATE;
+
+} else {
+
+  // Existing sprint/UAT/live logic
+
+  if (newStageIndex >= stages.indexOf("Under_Development")) {
+    allowedFields.sprint_start_date =
+      currentProject.SPRINT_START_DATE ||
+      (allowedFields.project_stage === "Under_Development"
+        ? today
+        : null);
+
+    allowedFields.sprint_end_date =
+      currentProject.PROJECT_STAGE === "Under_Development" &&
+      newStageIndex > oldStageIndex
+        ? today
+        : currentProject.SPRINT_END_DATE || null;
+  } else {
+    allowedFields.sprint_start_date = null;
+    allowedFields.sprint_end_date = null;
+  }
+
+  const uatIndex = stages.indexOf("UAT_Signoff");
+  allowedFields.uat_release_date =
+    oldStageIndex < uatIndex && newStageIndex >= uatIndex
+      ? currentProject.UAT_RELEASE_DATE || today
+      : newStageIndex < uatIndex
+      ? null
+      : currentProject.UAT_RELEASE_DATE;
+
+  const liveIndex = stages.indexOf("Live");
+  allowedFields.go_live_end_date =
+    oldStageIndex < liveIndex && newStageIndex >= liveIndex
+      ? currentProject.GO_LIVE_END_DATE || today
+      : newStageIndex < liveIndex
+      ? null
+      : currentProject.GO_LIVE_END_DATE;
+}
     // Man-days
-    allowedFields.man_days =
-      allowedFields.start_date && allowedFields.planned_end_date
-        ? await calculateManDays(
-            allowedFields.start_date,
-            allowedFields.planned_end_date
-          )
-        : currentProject.MAN_DAYS;
+if (allowedFields.project_stage === "Hold") {
+
+  // Freeze current value
+  allowedFields.man_days = currentProject.MAN_DAYS;
+
+} else {
+
+  allowedFields.man_days =
+    allowedFields.start_date &&
+    allowedFields.planned_end_date
+      ? await calculateManDays(
+          allowedFields.start_date,
+          allowedFields.planned_end_date
+        )
+      : currentProject.MAN_DAYS;
+
+}
 
     // --------------------------------------------------
     // Auto compute on_track_status
     // --------------------------------------------------
     // ✅ Correct call
-allowedFields.on_track_status = computeOnTrackStatus(
-  allowedFields.planned_end_date,
-  allowedFields.project_stage,
-  currentProject.ON_TRACK_STATUS,
-  allowedFields.go_live_end_date
-);
+if (
+  String(allowedFields.project_stage).trim().toLowerCase() === "hold"
+) {
+  allowedFields.on_track_status = "On Hold";
+} else {
+  allowedFields.on_track_status = computeOnTrackStatus(
+    allowedFields.planned_end_date,
+    allowedFields.project_stage,
+    currentProject.ON_TRACK_STATUS,
+    allowedFields.go_live_end_date
+  );
+}
 
     // --------------------------------------------------
     // PROJECT_CHANGES_RECEIVED (MERGE)
@@ -887,18 +939,28 @@ allowedFields.on_track_status = computeOnTrackStatus(
     const existingChanges = await parseClobJson(
       currentProject.PROJECT_CHANGES_RECEIVED
     );
+let projectChanges = req.body.projectChangesReceived;
 
-    const incomingChanges = Array.isArray(req.body.projectChangesReceived)
-      ? req.body.projectChangesReceived.map((c) => ({
-          date: c.date,
-          stage: c.stage,
-          details: c.details,
-          updatedBy,
-          timestamp: c.timestamp || new Date().toISOString(),
-        }))
-      : [];
+if (typeof projectChanges === "string") {
+  try {
+    projectChanges = JSON.parse(projectChanges);
+  } catch {
+    projectChanges = [];
+  }
+}
+
+const incomingChanges = Array.isArray(projectChanges)
+  ? projectChanges.map((c) => ({
+      date: c.date,
+      stage: c.stage,
+      details: c.details,
+      updatedBy,
+      timestamp: c.timestamp || new Date().toISOString(),
+    }))
+  : [];
 
     const mergedChanges = [...existingChanges, ...incomingChanges];
+    console.log("merged",mergedChanges," ","exisiting",existingChanges," ","incoming",incomingChanges)
     const finalProjectChangesReceived =
       mergedChanges.length > 0 ? JSON.stringify(mergedChanges) : null;
 
@@ -934,7 +996,11 @@ allowedFields.on_track_status = computeOnTrackStatus(
         changes,
       });
     }
-
+console.log(
+  "FINAL VALUES",
+  allowedFields.project_stage,
+  allowedFields.on_track_status
+);
     // --------------------------------------------------
     // UPDATE PROJECT
     // --------------------------------------------------
@@ -985,7 +1051,7 @@ allowedFields.on_track_status = computeOnTrackStatus(
       },
       { autoCommit: true }
     );
-
+console.log(finalProjectChangesReceived)
     // --------------------------------------------------
     // Fetch updated project
     // --------------------------------------------------
@@ -1001,6 +1067,7 @@ allowedFields.on_track_status = computeOnTrackStatus(
       updatedBy,
       changes,
     });
+    
   } catch (err) {
     console.error(err);
     res.status(400).json({ error: err.message });
