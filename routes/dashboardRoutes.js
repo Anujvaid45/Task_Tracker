@@ -1357,7 +1357,8 @@ router.get(
   }
 );
 
-
+const round2 = (value) =>
+  Number(Number(value || 0).toFixed(2));
 // ---------------------- Tasks Progress Weekly ----------------------
 router.get(
   "/tasks-progress-weekly",
@@ -1933,7 +1934,33 @@ router.get(
       // --------------------------------------------------------------------------
       // RESPONSE
       // --------------------------------------------------------------------------
+// ------------------------------------------------------------
+// ROUND HOURS FOR RESPONSE
+// ------------------------------------------------------------
 
+Object.values(employeeWeekly).forEach((emp) => {
+  Object.values(emp.weekly).forEach((week) => {
+    week.workloadHours = round2(week.workloadHours);
+    week.loggedHours = round2(week.loggedHours);
+    week.remainingHours = round2(week.remainingHours);
+  });
+});
+
+Object.values(weeklyStats).forEach((week) => {
+  week.workloadHours = round2(week.workloadHours);
+  week.loggedHours = round2(week.loggedHours);
+  week.remainingHours = round2(week.remainingHours);
+});
+
+monthlyOverview.workloadHours =
+  round2(monthlyOverview.workloadHours);
+
+monthlyOverview.loggedHours =
+  round2(monthlyOverview.loggedHours);
+
+monthlyOverview.remainingHours =
+  round2(monthlyOverview.remainingHours);
+  
       res.json({
         weekly:
           Object.values(employeeWeekly),
