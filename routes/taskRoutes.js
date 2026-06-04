@@ -543,7 +543,11 @@ router.put(
       // ------------------------------------------------------------------
       // 2️⃣ Lock completed components
       // ------------------------------------------------------------------
-      if (log.COMPONENT_STATUS === "Completed") {
+      if (
+  ["Completed","Live", "Preprod_Signoff"].includes(
+    log.COMPONENT_STATUS
+  )
+) {
         return res.status(400).json({
           error:
             "This component is already completed. Logs cannot be edited.",
@@ -1528,6 +1532,45 @@ router.patch(
               { ...bindData, compId },
               { autoCommit: false }
             );
+
+              // ---------------------------------------------------------
+// ✅ If workload increased beyond logged hours,
+// reset completed component back to WIP
+// ---------------------------------------------------------
+
+const logCheck = await connection.execute(
+  `
+  SELECT NVL(SUM(HOURS_LOGGED),0) AS LOGGED_HOURS
+  FROM COMPONENT_WORKLOGS
+  WHERE TASK_COMPONENT_ID = :compId
+  `,
+  { compId },
+  { outFormat: oracledb.OUT_FORMAT_OBJECT }
+);
+
+const loggedHours =
+  Number(logCheck.rows[0]?.LOGGED_HOURS || 0);
+
+const newTotalHours =
+  Number(comp.totalCompHours || 0);
+
+if (loggedHours < newTotalHours - 0.01) {
+
+  await connection.execute(
+    `
+    UPDATE TASK_COMPONENTS
+    SET
+      STATUS = 'Under_Development',
+      COMPLETED_AT = NULL,
+      UPDATED_AT = SYSTIMESTAMP
+    WHERE TASK_COMPONENT_ID = :compId
+      AND STATUS IN ('Live', 'Preprod_Signoff')
+    `,
+    { compId },
+    { autoCommit: false }
+  );
+}
+
           } else {
             await connection.execute(
               `
@@ -1697,7 +1740,7 @@ if (updateData.completedAt) {
 if (Array.isArray(req.body.components)) {
 
   // ✅ prevent stale frontend overwrite
-  delete updateData.WORKLOAD_HOURS;
+  // delete updateData.WORKLOAD_HOURS;
   delete updateData.status;
   delete updateData.completedAt;
 
@@ -1816,7 +1859,7 @@ router.patch(
       // -------------------------------------------------------------------------
       // STEP 4️⃣ — Update component status
       // -------------------------------------------------------------------------
-      const completedStatuses = ["Live", "Preprod_Signoff"];
+      const completedStatuses = ["Live", "Preprod_Signoff","Completed"];
       const binds = { status, updatedAt: new Date(), id };
       let completedAtClause = "";
 
